@@ -8,7 +8,7 @@ on:
 jobs:
   dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
       has_jobs: ${{ steps.compute.outputs.has_jobs }}
@@ -39,7 +39,7 @@ jobs:
     needs: dispatch
     if: needs.dispatch.outputs.has_jobs == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
