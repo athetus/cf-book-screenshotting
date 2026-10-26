@@ -11,20 +11,26 @@ Subcommands:
 
 import argparse
 import asyncio
+import hashlib
 import io
 import json
 import os
 import re
+import socket
 import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-import imagehash
 from PIL import Image, ImageDraw, ImageFont
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from playwright.async_api import async_playwright
+
+# Give every socket (including Drive API HTTP calls) a hard 120-second
+# read/write deadline.  Without this, a stalled upload can hang forever and
+# eventually raise the "read operation timed out" error seen in run #5382.
+socket.setdefaulttimeout(120)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -35,6 +41,7 @@ VIEWPORT = {"width": 1440, "height": 900}
 NAV_TIMEOUT_MS = 45000
 POST_LOAD_WAIT_MS = 2500
 DEFAULT_RUN_HOURS = [9, 19]
+ZOOM_OUT_FACTOR = "70%"
 
 
 def get_credentials():
@@ -67,7 +74,7 @@ def find_or_create_subfolder(drive_service, parent_id, name):
         fields="files(id,name)",
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=3)
     if res.get("files"):
         return res["files"][0]["id"]
     created = drive_service.files().create(
@@ -78,7 +85,7 @@ def find_or_create_subfolder(drive_service, parent_id, name):
         },
         fields="id",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=3)
     return created["id"]
 
 
@@ -89,12 +96,7 @@ def upload_to_drive(drive_service, folder_id, name, data):
         media_body=media,
         fields="id",
         supportsAllDrives=True,
-    ).execute()
-
-
-def compute_phash(png_bytes):
-    img = Image.open(io.BytesIO(png_bytes))
-    return str(imagehash.phash(img))  # 16 hex chars
+    ).execute(num_retries=3)
 
 
 # ---------- URL banner ----------
@@ -108,9 +110,9 @@ URL_TEXT_COLOR = (60, 64, 67)
 
 def _load_font(size):
     for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",          # ubuntu runner
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "C:/Windows/Fonts/arial.ttf",                                # local dev
+        "C:/Windows/Fonts/arial.ttf",
     ):
         try:
             return ImageFont.truetype(path, size)
@@ -145,19 +147,55 @@ def add_url_banner(png_bytes, url):
     return out.getvalue()
 
 
-def filtered_has_phash(drive_service, filtered_folder_id, phash):
+META_BAR_HEIGHT = 28
+META_BAR_BG = (241, 243, 244)
+META_TEXT_COLOR = (32, 33, 36)
+
+
+def add_meta_banner(png_bytes, category, captured_at):
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    banner = Image.new("RGB", (img.width, img.height + META_BAR_HEIGHT), META_BAR_BG)
+    banner.paste(img, (0, META_BAR_HEIGHT))
+    draw = ImageDraw.Draw(banner)
+
+    font = _load_font(14)
+    text = (
+        f"Category: {category or 'N/A'}    "
+        f"Captured: {captured_at.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    draw.text((14, META_BAR_HEIGHT // 2), text, fill=META_TEXT_COLOR, font=font, anchor="lm")
+
+    out = io.BytesIO()
+    banner.save(out, format="PNG")
+    return out.getvalue()
+
+
+FILTERED_NAME_RE = re.compile(r"^rank(\d+)_")
+
+
+def find_filtered_entries(drive_service, filtered_folder_id, key_slug):
+    safe_key = key_slug.replace("'", "\\'")
     q = (
         f"'{filtered_folder_id}' in parents and trashed = false and "
-        f"name contains '{phash}_'"
+        f"name contains '{safe_key}'"
     )
     res = drive_service.files().list(
         q=q,
-        fields="files(id)",
+        fields="files(id,name)",
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
-        pageSize=1,
-    ).execute()
-    return bool(res.get("files"))
+        pageSize=10,
+    ).execute(num_retries=3)
+    entries = []
+    for f in res.get("files", []):
+        m = FILTERED_NAME_RE.match(f["name"])
+        if m:
+            entries.append((f["id"], int(m.group(1))))
+    return entries
+
+
+def delete_from_drive(drive_service, file_id):
+    drive_service.files().delete(fileId=file_id, supportsAllDrives=True).execute(num_retries=3)
 
 
 # ---------- Sheets ----------
@@ -168,7 +206,7 @@ def read_data_sheet(sheets_service, sheet_id, range_="A:D"):
     ).execute()
     rows = res.get("values", [])
     out = []
-    for row in rows[1:]:  # skip header
+    for row in rows[1:]:
         row = (row + [""] * 4)[:4]
         category, url, country, keyword = (c.strip() for c in row)
         if url and keyword:
@@ -186,7 +224,6 @@ def get_sheet_title(sheets_service, sheet_id):
 
 
 def read_control_sheet(sheets_service, control_id):
-    """Return (jobs, run_hours)."""
     jobs_res = sheets_service.spreadsheets().values().get(
         spreadsheetId=control_id, range="Jobs!A:D"
     ).execute()
@@ -249,8 +286,6 @@ def cmd_dispatch():
     active = []
 
     def write_outputs():
-        # Matrix must always have at least one entry, otherwise GitHub Actions
-        # errors on strategy expansion. Use a sentinel when there's no work.
         if active:
             matrix_value = active
             has_jobs = "true"
@@ -328,6 +363,32 @@ def cmd_dispatch():
 
 # ---------- run ----------
 
+_RANK_BADGE_JS = """
+(el) => {
+    const rx = /#\\s?\\d{1,4}\\b/g;
+    let cur = el;
+    for (let i = 0; i < 20 && cur; i++) {
+        const matches = (cur.innerText || '').match(rx) || [];
+        if (matches.length === 1) return matches[0];
+        if (matches.length > 1) return null;
+        cur = cur.parentElement;
+    }
+    return null;
+}
+"""
+
+
+async def extract_rank(page, keyword):
+    try:
+        matched_text = await page.get_by_text(keyword, exact=False).first.evaluate(_RANK_BADGE_JS)
+    except Exception:
+        return None
+    if not matched_text:
+        return None
+    digits = re.sub(r"\D", "", matched_text)
+    return int(digits) if digits else None
+
+
 async def process_row(page, row, drive_service, drive_folder_id, filtered_folder_id, sheet_label):
     url = row["url"]
     keyword = row["keyword"]
@@ -352,6 +413,17 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         print("  keyword not found", flush=True)
         return False
 
+    rank = await extract_rank(page, keyword)
+    print(f"  rank: {rank if rank is not None else 'not found'}", flush=True)
+
+    try:
+        await page.evaluate(
+            "(z) => { document.documentElement.style.zoom = z; }", ZOOM_OUT_FACTOR
+        )
+        await page.wait_for_timeout(300)
+    except Exception as e:
+        print(f"  zoom failed: {e}", flush=True)
+
     try:
         await page.get_by_text(keyword, exact=False).first.scroll_into_view_if_needed(
             timeout=4000
@@ -361,12 +433,13 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         pass
 
     raw_png = await page.screenshot(full_page=False)
+    captured_at = datetime.now(timezone.utc)
     try:
-        png = add_url_banner(raw_png, page.url)
+        png = add_meta_banner(add_url_banner(raw_png, page.url), row["category"], captured_at)
     except Exception as e:
-        print(f"  url banner failed ({e}); uploading without it", flush=True)
+        print(f"  banner failed ({e}); uploading without it", flush=True)
         png = raw_png
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    ts = captured_at.strftime("%Y%m%d-%H%M%S")
     name = (
         f"{ts}_{slugify(row['category'])}_"
         f"{slugify(row['country'])}_{slugify(keyword)}.png"
@@ -375,18 +448,34 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     print(f"  uploaded {name}", flush=True)
 
     if filtered_folder_id:
-        try:
-            # Hash the raw page (banner excluded) so hashes stay comparable
-            # with files uploaded before the banner existed.
-            phash = compute_phash(raw_png)
-            if filtered_has_phash(drive_service, filtered_folder_id, phash):
-                print(f"  duplicate (phash {phash}); skipping filtered upload", flush=True)
-            else:
-                filtered_name = f"{phash}_{name}"
-                upload_to_drive(drive_service, filtered_folder_id, filtered_name, png)
-                print(f"  uploaded {filtered_name} to filtered", flush=True)
-        except Exception as e:
-            print(f"  filtered dedup failed: {e}", flush=True)
+        if rank is None:
+            print("  rank not found; skipping filtered folder update", flush=True)
+        else:
+            try:
+                url_key = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+                readable = (
+                    f"{slugify(row['category'])}_{slugify(row['country'])}_{slugify(keyword)}"
+                )
+                existing = find_filtered_entries(drive_service, filtered_folder_id, url_key)
+                best_existing_rank = min((r for _, r in existing), default=None)
+                if best_existing_rank is None or rank < best_existing_rank:
+                    for file_id, _ in existing:
+                        delete_from_drive(drive_service, file_id)
+                    filtered_name = f"rank{rank:04d}_{url_key}_{readable}_{ts}.png"
+                    upload_to_drive(drive_service, filtered_folder_id, filtered_name, png)
+                    print(
+                        f"  uploaded {filtered_name} to filtered "
+                        f"(rank #{rank}, previous best {best_existing_rank})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  rank #{rank} not better than existing best #{best_existing_rank}; "
+                        f"skipping filtered upload",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"  filtered rank update failed: {e}", flush=True)
 
     return True
 
