@@ -2,13 +2,30 @@ name: screenshot
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour; run hours are filtered in the dispatcher
-  workflow_dispatch: {}
+    # Hourly. Minute 35 avoids GitHub's busiest minute (:00, where scheduled
+    # runs are often dropped) and lands inside the same Asia/Kolkata hour as
+    # the external :30 trigger. Each finished chunk leaves a marker in Drive
+    # for its local hour and later runs skip it, so both triggers can stay on.
+    - cron: "35 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if this hour's chunks are already done"
+        type: boolean
+        default: false
+
+# One run at a time; a newer trigger waits instead of overlapping.
+concurrency:
+  group: screenshot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   dispatch:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
       has_jobs: ${{ steps.compute.outputs.has_jobs }}
@@ -23,25 +40,30 @@ jobs:
       - name: Write service account credentials
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-        run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
+        run: |
+          umask 077
+          printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/credentials.json"
       - name: Compute active jobs
         id: compute
         env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/credentials.json
           CONTROL_SHEET_ID: ${{ secrets.CONTROL_SHEET_ID }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-        run: |
-          python screenshot_runner.py dispatch
-          echo "----- GITHUB_OUTPUT contents -----"
-          cat "$GITHUB_OUTPUT"
-          echo "----- end -----"
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FORCE_RERUN: ${{ inputs.force }}
+        run: python screenshot_runner.py dispatch
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/credentials.json"
 
   run:
     needs: dispatch
     if: needs.dispatch.outputs.has_jobs == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix:
         job: ${{ fromJSON(needs.dispatch.outputs.matrix) }}
     steps:
@@ -57,11 +79,35 @@ jobs:
       - name: Write service account credentials
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-        run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
-      - name: Process sheet
         run: |
-          python screenshot_runner.py run \
-            --sheet-id "${{ matrix.job.sheet_id }}" \
-            --drive-folder-id "${{ matrix.job.subfolder_id }}" \
-            --filtered-folder-id "${{ matrix.job.filtered_subfolder_id }}" \
-            --sheet-name "${{ matrix.job.sheet_name }}"
+          umask 077
+          printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/credentials.json"
+      - name: Process sheet chunk
+        env:
+          # Passed through env, never pasted into the shell script, so sheet
+          # data can't inject commands.
+          MATRIX_JOB: ${{ matrix.job }}
+          FORCE_RERUN: ${{ inputs.force }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/credentials.json
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python screenshot_runner.py run
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/credentials.json"
+
+  alert:
+    # Catches failures the Python code can't report itself (install steps,
+    # a crashed job, a timeout).
+    needs: [dispatch, run]
+    if: failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then echo "No SLACK_WEBHOOK_URL secret; skipping"; exit 0; fi
+          payload=$(python3 -c 'import json,os; print(json.dumps({"text": ":rotating_light: Screenshot run failed: " + os.environ["RUN_URL"]}))')
+          curl -sS -m 20 -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
