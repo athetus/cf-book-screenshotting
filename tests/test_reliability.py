@@ -510,3 +510,15 @@ def test_run_force_retakes_rows_taken_this_hour(monkeypatch):
     monkeypatch.setenv("FORCE_RERUN", "true")
     asyncio.run(sr.cmd_run(entry))
     assert len(_pngs(drive, "main")) == 2
+
+
+def test_logs_never_show_sheet_title_or_book_title(monkeypatch, capsys, tmp_path):
+    rows = [["Fiction", "https://a/1", "US", "Secret Book Title"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Secret Book Title"})
+    asyncio.run(sr.cmd_run(entry))
+    out, _ = _setup_dispatch(monkeypatch, tmp_path, 5)
+    sr.cmd_dispatch()
+    logs = capsys.readouterr()
+    text = logs.out + logs.err
+    assert "Secret Book Title" not in text and "Secret_Book_Title" not in text
+    assert "Jane Doe" not in text and "Book'" not in text

@@ -328,7 +328,7 @@ def update_filtered_best(drive_service, filtered_folder_id, url, row, rank, ts, 
     for file_id, _ in existing:
         if file_id != new_id:
             delete_from_drive(drive_service, file_id)
-    return f"uploaded {filtered_name} to filtered (rank #{rank}, previous best {best_existing_rank})"
+    return f"uploaded to filtered (rank #{rank}, previous best {best_existing_rank})"
 
 
 # ---------- Sheets ----------
@@ -590,7 +590,11 @@ def cmd_dispatch():
         if due:
             markers_id = find_or_create_subfolder(drive_service, drive_folder_id, MARKERS_FOLDER)
         seen = set()
+        # Logs are public while the repo is public: they name sheets by an id
+        # prefix only, never by title (client and book names). Slack gets titles.
+        titles = {}
         for job, hkey in due:
+            tag = job["sheet_id"][:8]
             if job["sheet_id"] in seen:
                 print(f"  skip row {job['row']}: sheet already dispatched by another row", flush=True)
                 continue
@@ -608,11 +612,13 @@ def cmd_dispatch():
                     drive_service, drive_folder_id, f"{title} filtered"
                 )
             except Exception as e:
-                print(f"  row {job['row']}: cannot create subfolder for '{title}' ({e})", file=sys.stderr, flush=True)
-                problems.append(f"'{title}': cannot create Drive folder")
+                print(f"  row {job['row']} ({tag}): cannot create subfolder ({e})", file=sys.stderr, flush=True)
+                problems.append(f"sheet {tag}: cannot create Drive folder")
+                titles[tag] = title
                 continue
             if n_rows == 0:
-                problems.append(f"'{title}': no rows with both URL and keyword")
+                problems.append(f"sheet {tag}: no rows with both URL and keyword")
+                titles[tag] = title
                 continue
             ranges = chunk_ranges(n_rows, settings["chunk_rows"])
             skipped = 0
@@ -625,9 +631,9 @@ def cmd_dispatch():
                                         start, end, markers_id, hkey)
                 )
             if skipped:
-                print(f"  '{title}': {skipped} chunk(s) already done this hour ({hkey}); skipped", flush=True)
+                print(f"  sheet {tag}: {skipped} chunk(s) already done this hour ({hkey}); skipped", flush=True)
             print(
-                f"  ACTIVE: '{title}' ({n_rows} rows, {len(ranges)} chunks) -> {subfolder_id} "
+                f"  ACTIVE: sheet {tag} ({n_rows} rows, {len(ranges)} chunks) -> {subfolder_id} "
                 f"| filtered -> {filtered_subfolder_id}",
                 flush=True,
             )
@@ -641,7 +647,9 @@ def cmd_dispatch():
         print(f"Active chunks to dispatch: {len(active)}", flush=True)
         if problems:
             print("::error::Screenshot dispatch problems: " + "; ".join(problems), flush=True)
-            notify_slack(":warning: Screenshot dispatch problems: " + "; ".join(problems))
+            names = "; ".join(f"{k} = {v}" for k, v in titles.items())
+            notify_slack(":warning: Screenshot dispatch problems: " + "; ".join(problems)
+                         + (f" ({names})" if names else ""))
             if not active:
                 # Work was due but nothing could be dispatched: fail so the
                 # run shows red instead of passing with no screenshots.
@@ -726,7 +734,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     on the page. Raises RowError when the row could not be checked."""
     url = row["url"]
     keyword = row["keyword"]
-    print(f"[{sheet_label}] {url} :: '{keyword}'", flush=True)
+    print(f"[{sheet_label}] {row['category'][:60]} / {row['country']}", flush=True)
 
     if not is_allowed_url(url):
         raise RowError(f"not an http(s) URL: {url[:80]}")
@@ -784,7 +792,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         upload_to_drive(drive_service, drive_folder_id, name, png)
     except Exception as e:
         raise RowError(f"upload failed: {e}") from e
-    print(f"  uploaded {name}", flush=True)
+    print("  uploaded screenshot", flush=True)
 
     if filtered_folder_id:
         if rank is None:
@@ -804,7 +812,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
 def summarize(label, start, end, found, not_found, errors, skipped=0):
     total = end - start
     return (
-        f"'{label}' rows {start + 1}-{end}: {found} screenshots, "
+        f"sheet {label} rows {start + 1}-{end}: {found} screenshots, "
         f"{not_found} keyword not found, {skipped} already done this hour, "
         f"{len(errors)} errors (of {total})"
     )
@@ -828,10 +836,11 @@ async def cmd_run(matrix_entry):
     sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
+    label = sheet_id[:8]  # public logs: id prefix only
     try:
-        label = get_sheet_title(sheets_service, sheet_id)
+        title = get_sheet_title(sheets_service, sheet_id)
     except Exception:
-        label = sheet_id[:8]
+        title = label
     rows = read_data_sheet(sheets_service, sheet_id)[start:end]
     last = start + len(rows)  # the sheet may have shrunk since dispatch
     print(f"=== Sheet '{label}' rows {start + 1}-{last} ===", flush=True)
@@ -882,7 +891,7 @@ async def cmd_run(matrix_entry):
     for err in errors[:20]:
         print(f"  - {err}", flush=True)
     if errors:
-        notify_slack(f":warning: Screenshots {summary}. First error: {errors[0][:200]}")
+        notify_slack(f":warning: Screenshots for {title}: {summary}. First error: {errors[0][:200]}")
     if should_fail(found, errors, found + not_found + len(errors)):
         print("::error::" + summary, flush=True)
         sys.exit(1)
@@ -895,7 +904,7 @@ async def cmd_run(matrix_entry):
         mark_chunk_done(drive_service, markers_id, sheet_id, hkey, start, end, summary)
     except Exception as e:
         print(f"::warning::could not write done-marker: {e}", flush=True)
-        notify_slack(f":warning: Screenshot chunk done but its marker failed ({label}): {e}")
+        notify_slack(f":warning: Screenshot chunk done but its marker failed ({title}): {e}")
 
 
 # ---------- entry ----------
