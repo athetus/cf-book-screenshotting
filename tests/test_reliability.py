@@ -522,3 +522,73 @@ def test_logs_never_show_sheet_title_or_book_title(monkeypatch, capsys, tmp_path
     text = logs.out + logs.err
     assert "Secret Book Title" not in text and "Secret_Book_Title" not in text
     assert "Jane Doe" not in text and "Book'" not in text
+
+
+# ---------- reaudit round (3 Nov) ----------
+
+def test_unique_rows_drops_repeats_keeps_order():
+    a = {"category": "F", "country": "US", "keyword": "B", "url": "https://a/1"}
+    b = dict(a, url="https://a/2")
+    assert sr.unique_rows([a, b, dict(a), b]) == [a, b]
+
+
+def test_dispatch_counts_unique_rows_only(monkeypatch, tmp_path):
+    out, _ = _setup_dispatch(monkeypatch, tmp_path, 3)
+    monkeypatch.setattr(sr, "read_data_sheet", lambda s, i: [
+        {"category": "F", "country": "US", "keyword": "B", "url": f"https://a/{n % 2}"} for n in range(250)
+    ])
+    sr.cmd_dispatch()
+    matrix, _ = _outputs(out)
+    assert [sr.decode_matrix_entry(e)[3:5] for e in matrix] == [(0, 2)]
+
+
+def test_public_text_hides_urls():
+    assert sr.public_text("Page.goto: timeout https://www.amazon.com/My-Book-Title/dp/1 x") == "Page.goto: timeout <url> x"
+
+
+def test_is_allowed_url_blocks_trailing_dot_and_backslash_tricks():
+    assert not sr.is_allowed_url("http://localhost./")
+    assert not sr.is_allowed_url("http://127.0.0.1./")
+    assert not sr.is_allowed_url("http://\\127.0.0.1/")
+    assert not sr.is_allowed_url("http://metadata.google.internal./")
+
+
+def test_upload_final_check_finds_file_that_landed_on_last_attempt():
+    drive = FakeDrive()
+    f = drive.files()
+    f.create_failures = [TimeoutError("t")] * sr.UPLOAD_ATTEMPTS
+    f.create_lands_then_fails = True
+    fid = sr.upload_to_drive(drive, "folder", "a.png", b"x", sleep=lambda s: None)
+    assert fid in f.files and len(f.files) == 1
+
+
+def test_dispatch_problems_output_set_when_one_sheet_fails(monkeypatch, tmp_path):
+    out, _ = _setup_dispatch(monkeypatch, tmp_path, 5)
+    real = sr.read_control_sheet
+
+    def two_jobs(sheets, cid):
+        jobs, settings = real(sheets, cid)
+        broken = dict(jobs[0], row=9, sheet_id="MISSING1")
+        return [jobs[0], broken], settings
+
+    monkeypatch.setattr(sr, "read_control_sheet", two_jobs)
+    sr.cmd_dispatch()
+    lines = dict(l.split("=", 1) for l in out.read_text().splitlines())
+    assert lines["has_jobs"] == "true"
+    assert lines["problems"] == "true"
+
+
+def test_run_stops_at_time_budget_and_leaves_no_marker(monkeypatch):
+    rows = [["Fiction", f"https://a/{i}", "US", "Some Book"] for i in range(3)]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {f"https://a/{i}": "#1 Some Book" for i in range(3)})
+    monkeypatch.setattr(sr, "RUN_BUDGET_S", -1)
+    asyncio.run(sr.cmd_run(entry))
+    assert _pngs(drive, "main") == []
+    assert not sr.chunk_done(drive, "mk", "S", hkey, 0, 3)
+
+
+def test_run_with_no_book_found_still_marks_done(monkeypatch):
+    rows = [["Fiction", "https://a/1", "US", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "other books only"})
+    asyncio.run(sr.cmd_run(entry))
+    assert sr.chunk_done(drive, "mk", "S", hkey, 0, 1)
