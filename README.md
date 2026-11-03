@@ -12,7 +12,7 @@ Takes bestseller-rank proof screenshots of Amazon category pages and saves them 
 
 ## Control sheet
 - Tab `Jobs`: A sheet URL, B start `YYYY-MM-DD HH:MM`, C stop `YYYY-MM-DD HH:MM`, D timezone (e.g. `Asia/Kolkata`; empty = UTC).
-- Tab `Settings` (optional): `run_hours` = comma list of local hours 0-23 (24 = midnight), default `9,19`; `chunk_rows`, default `120`.
+- Tab `Settings` (optional): `run_hours` = comma list of local hours 0-23 (24 = midnight), default `9,19`; `chunk_rows`, default `120`, max `200`.
 - Data sheet: header row, then A category, B URL, C country, D keyword.
 - Share the control sheet and every data sheet (view) and the Drive folder (edit) with the service account.
 
@@ -23,6 +23,7 @@ Takes bestseller-rank proof screenshots of Amazon category pages and saves them 
 
 ## Triggers
 - GitHub schedule at minute 35 every hour (GitHub may delay or skip these).
+- Weekly keepalive (Monday 03:50 UTC): re-enables the workflow against GitHub's 60-day inactivity switch-off for public repos. It rides on GitHub's own schedule, which can skip runs, so have the external caller also send `PUT /repos/<owner>/<repo>/actions/workflows/screenshot.yml/enable` weekly.
 - Optional external hourly trigger: `POST /repos/<owner>/<repo>/actions/workflows/screenshot.yml/dispatches` with `{"ref":"main"}`.
 
 ## Local test

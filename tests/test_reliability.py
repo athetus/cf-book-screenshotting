@@ -324,7 +324,7 @@ def test_process_row_uploads_and_updates_filtered():
 
 
 def test_process_row_keyword_missing_returns_false():
-    page = FakePage(["nothing here"])
+    page = FakePage(["#1 Other Book #2 Another Book"])
     assert asyncio.run(sr.process_row(page, ROW, FakeDrive(), "main", "filt", "L")) is False
 
 
@@ -522,3 +522,143 @@ def test_logs_never_show_sheet_title_or_book_title(monkeypatch, capsys, tmp_path
     text = logs.out + logs.err
     assert "Secret Book Title" not in text and "Secret_Book_Title" not in text
     assert "Jane Doe" not in text and "Book'" not in text
+
+
+# ---------- reaudit round (3 Nov) ----------
+
+def test_unique_rows_drops_repeats_keeps_order():
+    a = {"category": "F", "country": "US", "keyword": "B", "url": "https://a/1"}
+    b = dict(a, url="https://a/2")
+    assert sr.unique_rows([a, b, dict(a), b]) == [a, b]
+
+
+def test_dispatch_counts_unique_rows_only(monkeypatch, tmp_path):
+    out, _ = _setup_dispatch(monkeypatch, tmp_path, 3)
+    monkeypatch.setattr(sr, "read_data_sheet", lambda s, i: [
+        {"category": "F", "country": "US", "keyword": "B", "url": f"https://a/{n % 2}"} for n in range(250)
+    ])
+    sr.cmd_dispatch()
+    matrix, _ = _outputs(out)
+    assert [sr.decode_matrix_entry(e)[3:5] for e in matrix] == [(0, 2)]
+
+
+def test_public_text_hides_urls():
+    assert sr.public_text("Page.goto: timeout https://www.amazon.com/My-Book-Title/dp/1 x") == "Page.goto: timeout <url> x"
+
+
+def test_is_allowed_url_blocks_trailing_dot_and_backslash_tricks():
+    assert not sr.is_allowed_url("http://localhost./")
+    assert not sr.is_allowed_url("http://127.0.0.1./")
+    assert not sr.is_allowed_url("http://\\127.0.0.1/")
+    assert not sr.is_allowed_url("http://metadata.google.internal./")
+
+
+def test_upload_final_check_finds_file_that_landed_on_last_attempt():
+    drive = FakeDrive()
+    f = drive.files()
+    f.create_failures = [TimeoutError("t")] * sr.UPLOAD_ATTEMPTS
+    f.create_lands_then_fails = True
+    fid = sr.upload_to_drive(drive, "folder", "a.png", b"x", sleep=lambda s: None)
+    assert fid in f.files and len(f.files) == 1
+
+
+def test_dispatch_problems_output_set_when_one_sheet_fails(monkeypatch, tmp_path):
+    out, _ = _setup_dispatch(monkeypatch, tmp_path, 5)
+    real = sr.read_control_sheet
+
+    def two_jobs(sheets, cid):
+        jobs, settings = real(sheets, cid)
+        broken = dict(jobs[0], row=9, sheet_id="MISSING1")
+        return [jobs[0], broken], settings
+
+    monkeypatch.setattr(sr, "read_control_sheet", two_jobs)
+    sr.cmd_dispatch()
+    lines = dict(l.split("=", 1) for l in out.read_text().splitlines())
+    assert lines["has_jobs"] == "true"
+    assert lines["problems"] == "true"
+
+
+def test_run_stops_at_time_budget_and_leaves_no_marker(monkeypatch):
+    rows = [["Fiction", f"https://a/{i}", "US", "Some Book"] for i in range(3)]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {f"https://a/{i}": "#1 Some Book" for i in range(3)})
+    monkeypatch.setattr(sr, "RUN_BUDGET_S", -1)
+    asyncio.run(sr.cmd_run(entry))
+    assert _pngs(drive, "main") == []
+    assert not sr.chunk_done(drive, "mk", "S", hkey, 0, 3)
+
+
+def test_run_with_no_book_found_still_marks_done(monkeypatch):
+    rows = [["Fiction", "https://a/1", "US", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Other Book #2 Another Book"})
+    asyncio.run(sr.cmd_run(entry))
+    assert sr.chunk_done(drive, "mk", "S", hkey, 0, 1)
+
+
+# ---------- reaudit round 2 ----------
+
+def test_public_text_hides_schemeless_links_and_drive_queries():
+    assert "Book" not in sr.public_text("goto www.amazon.com/Book-Title/dp/1 failed")
+    t = sr.public_text('<HttpError 500 when requesting https://www.googleapis.com/drive/v3/files?q=name%3D%27Book_Title%27 returned "x">')
+    assert "Book_Title" not in t
+    assert "Book_Title" not in sr.public_text("bad request q=name='Book_Title' and x")
+
+
+def test_update_filtered_best_removes_extra_entries_from_parallel_chunks():
+    import hashlib
+    drive = FakeDrive()
+    f = drive.files()
+    url = "https://www.amazon.com/x"
+    key = hashlib.sha1(url.encode()).hexdigest()[:10]
+    a = f.add(f"rank0003_{key}_a.png", "filt")
+    f.add(f"rank0005_{key}_b.png", "filt")
+    f.add(f"rank0003_{key}_c.png", "filt")
+    row = {"category": "F", "country": "US", "keyword": "B"}
+    sr.update_filtered_best(drive, "filt", url, row, 7, "ts", b"png")
+    left = [(i, v["name"]) for i, v in f.files.items()]
+    assert len(left) == 1 and left[0][1].startswith("rank0003_")
+
+
+def test_process_row_non_list_page_is_an_error():
+    page = FakePage(["Welcome to the new Amazon homepage"])
+    with pytest.raises(sr.RowError):
+        asyncio.run(sr.process_row(page, ROW, FakeDrive(), "main", "", "L"))
+
+
+def test_chunk_rows_is_capped(monkeypatch):
+    sheets = FakeSheets({
+        ("ctl", "Jobs!A:D"): [["h"]],
+        ("ctl", "Settings!A:B"): [["k", "v"], ["chunk_rows", "1000"]],
+    })
+    _, settings = sr.read_control_sheet(sheets, "ctl")
+    assert settings["chunk_rows"] == sr.MAX_CHUNK_ROWS
+
+
+# ---------- reaudit round 3 ----------
+
+def test_public_text_hides_quoted_url_with_spaces_and_quoted_names():
+    t = sr.public_text('Page.goto: Timeout navigating to "https://www.amazon.com/gp/x/Secret Book Title/ref=x"')
+    assert "Secret" not in t and "Book Title" not in t
+    t = sr.public_text("Invalid query: name contains 'Secret Book' and parents")
+    assert "Secret Book" not in t
+
+
+def test_soft_block_page_is_detected():
+    assert sr.is_blocked_page("Click the button below to continue shopping")
+
+
+def test_bad_url_error_does_not_echo_cell():
+    row = dict(ROW, url="My Secret Book Title - Kindle")
+    with pytest.raises(sr.RowError) as e:
+        asyncio.run(sr.process_row(FakePage(["x"]), row, FakeDrive(), "main", "", "L"))
+    assert "Secret" not in str(e.value)
+
+
+def test_main_prints_filtered_error_not_traceback(monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("failed https://www.googleapis.com/drive/v3/files?q=name='Secret Book'")
+    monkeypatch.setattr(sr, "cmd_dispatch", boom)
+    monkeypatch.setattr(sr.sys, "argv", ["screenshot_runner.py", "dispatch"])
+    with pytest.raises(SystemExit):
+        sr.main()
+    out = capsys.readouterr()
+    assert "Secret" not in out.out + out.err and "Traceback" not in out.out + out.err

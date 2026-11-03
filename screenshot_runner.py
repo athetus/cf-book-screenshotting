@@ -46,6 +46,11 @@ DEFAULT_RUN_HOURS = [9, 19]
 # Rows per matrix job. ~7 s per row, so 120 rows is ~15 minutes, well inside
 # the job's timeout. Override with Settings!chunk_rows in the control sheet.
 DEFAULT_CHUNK_ROWS = 120
+# Stop starting new rows after this many seconds, well before the job's
+# 45-minute timeout (setup runs first), so a chunk slowed down by blocked pages still ends
+# cleanly; the next trigger this hour picks up the rest.
+RUN_BUDGET_S = 33 * 60  # plus ~5 min setup and one slow row stays under 45
+MAX_CHUNK_ROWS = 200  # larger chunks risk the job timeout
 MAX_MATRIX_JOBS = 256  # GitHub's limit per workflow run
 # Read-only Drive/Sheets calls are safe to retry. Uploads are not (a retry
 # after a timeout can create a second file), see upload_to_drive.
@@ -60,6 +65,7 @@ BLOCKED_MARKERS = (
     "sorry, we just need to make sure you're not a robot",
     "request was throttled",
     "to discuss automated access to amazon data",
+    "click the button below to continue shopping",
 )
 MATRIX_SEP = "|"
 # Drive folder (inside DRIVE_FOLDER_ID) holding one small marker file per
@@ -83,6 +89,23 @@ def extract_sheet_id(url_or_id):
     return m.group(1) if m else s
 
 
+def public_text(value, limit=300):
+    """Text safe for the public run logs: URLs (which can carry book titles)
+    are replaced, and long messages cut."""
+    text = str(value)
+    # Playwright puts the whole URL in quotes ("navigating to \"...\""),
+    # and a URL can contain spaces: hide quoted URLs whole first.
+    text = re.sub(r"([\"'])https?://.*?\1", r"\1<url>\1", text)
+    text = re.sub(r"https?://\S+", "<url>", text)
+    # Links written without a scheme (www.amazon.com/Book-Title/...).
+    text = re.sub(r"\b(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?/\S*", "<url>", text, flags=re.I)
+    # Drive/Sheets query strings name files (category, country, book title).
+    text = re.sub(r"\bq=\S+", "q=<query>", text)
+    # Quoted names in Drive/Sheets errors (name contains 'Book Title').
+    text = re.sub(r"'[^']{3,}'", "'<text>'", text)
+    return text[:limit]
+
+
 def _drive_quote(s):
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
@@ -103,7 +126,7 @@ def notify_slack(text):
         urllib.request.urlopen(req, timeout=20).read()
         return True
     except Exception as e:
-        print(f"  slack notify failed: {e}", file=sys.stderr, flush=True)
+        print(f"  slack notify failed: {public_text(e)}", file=sys.stderr, flush=True)
         return False
 
 
@@ -164,7 +187,7 @@ def upload_to_drive(drive_service, folder_id, name, data, sleep=None):
                 existing = find_file_by_name(drive_service, folder_id, name)
             except Exception as e:
                 existing = None
-                print(f"  upload check failed: {e}", flush=True)
+                print(f"  upload check failed: {public_text(e)}", flush=True)
             if existing:
                 return existing
         try:
@@ -178,7 +201,13 @@ def upload_to_drive(drive_service, folder_id, name, data, sleep=None):
             return created["id"]
         except Exception as e:
             last_exc = e
-            print(f"  upload attempt {attempt} failed: {e}", flush=True)
+            print(f"  upload attempt {attempt} failed: {public_text(e)}", flush=True)
+    try:
+        existing = find_file_by_name(drive_service, folder_id, name)
+    except Exception:
+        existing = None
+    if existing:
+        return existing
     raise last_exc
 
 
@@ -322,6 +351,12 @@ def update_filtered_best(drive_service, filtered_folder_id, url, row, rank, ts, 
     existing = find_filtered_entries(drive_service, filtered_folder_id, url_key)
     best_existing_rank = min((r for _, r in existing), default=None)
     if best_existing_rank is not None and rank >= best_existing_rank:
+        # Two chunks running at once can each upload a "best" for the same
+        # URL; keep one file at the best rank and remove the rest.
+        keep = next(fid for fid, r in existing if r == best_existing_rank)
+        for file_id, _ in existing:
+            if file_id != keep:
+                delete_from_drive(drive_service, file_id)
         return f"rank #{rank} not better than existing best #{best_existing_rank}; skipping filtered upload"
     filtered_name = f"rank{rank:04d}_{url_key}_{readable}_{ts}.png"
     new_id = upload_to_drive(drive_service, filtered_folder_id, filtered_name, png)
@@ -347,6 +382,23 @@ def read_data_sheet(sheets_service, sheet_id, range_="A:D"):
                 {"category": category, "url": url, "country": country, "keyword": keyword}
             )
     return out
+
+
+def unique_rows(rows):
+    """Drop repeated rows (same URL and labels), keeping the first. Dispatch
+    and run both use this, so chunk ranges point at the same rows."""
+    seen = set()
+    out = []
+    for r in rows:
+        key = row_suffix(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def load_rows(sheets_service, sheet_id):
+    return unique_rows(read_data_sheet(sheets_service, sheet_id))
 
 
 def get_sheet_title(sheets_service, sheet_id):
@@ -392,7 +444,7 @@ def read_control_sheet(sheets_service, control_id):
             start = datetime.strptime(start_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             stop = datetime.strptime(stop_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
         except Exception as e:
-            print(f"  Jobs row {i}: bad date/timezone ({e})", file=sys.stderr, flush=True)
+            print(f"  Jobs row {i}: bad date/timezone ({public_text(e)})", file=sys.stderr, flush=True)
             continue
         jobs.append(
             {
@@ -425,11 +477,11 @@ def read_control_sheet(sheets_service, control_id):
                     else:
                         print(f"::error::run_hours '{val}' has no valid hour; using {settings['run_hours']}", flush=True)
                 elif key == "chunk_rows":
-                    settings["chunk_rows"] = max(10, int(val))
+                    settings["chunk_rows"] = min(MAX_CHUNK_ROWS, max(10, int(val)))
             except ValueError as e:
-                print(f"  bad {key} value '{val}': {e}", file=sys.stderr, flush=True)
+                print(f"  bad {key} value '{val}': {public_text(e)}", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"  could not read Settings tab (using defaults): {e}", file=sys.stderr, flush=True)
+        print(f"  could not read Settings tab (using defaults): {public_text(e)}", file=sys.stderr, flush=True)
 
     return jobs, settings
 
@@ -537,6 +589,7 @@ def mark_chunk_done(drive_service, markers_id, sheet_id, hour_key_, start, end, 
 def cmd_dispatch():
     output_path = os.environ.get("GITHUB_OUTPUT")
     active = []
+    problems = []
 
     def write_outputs():
         # Matrix must always have at least one entry, otherwise GitHub Actions
@@ -548,6 +601,7 @@ def cmd_dispatch():
             with open(output_path, "a", encoding="utf-8") as f:
                 f.write(f"matrix={payload}\n")
                 f.write(f"has_jobs={has_jobs}\n")
+                f.write(f"problems={'true' if problems else 'false'}\n")
         print(f"Matrix entries: {len(active)}", flush=True)
 
     try:
@@ -584,7 +638,6 @@ def cmd_dispatch():
                 continue
             due.append((job, hour_key(now_in_tz)))
 
-        problems = []
         force = os.environ.get("FORCE_RERUN", "").strip().lower() == "true"
         markers_id = None
         if due:
@@ -601,9 +654,9 @@ def cmd_dispatch():
             seen.add(job["sheet_id"])
             try:
                 title = get_sheet_title(sheets_service, job["sheet_id"])
-                n_rows = len(read_data_sheet(sheets_service, job["sheet_id"]))
+                n_rows = len(load_rows(sheets_service, job["sheet_id"]))
             except Exception as e:
-                print(f"  row {job['row']}: cannot read sheet ({e})", file=sys.stderr, flush=True)
+                print(f"  row {job['row']}: cannot read sheet ({public_text(e)})", file=sys.stderr, flush=True)
                 problems.append(f"control row {job['row']}: cannot read data sheet")
                 continue
             try:
@@ -612,7 +665,7 @@ def cmd_dispatch():
                     drive_service, drive_folder_id, f"{title} filtered"
                 )
             except Exception as e:
-                print(f"  row {job['row']} ({tag}): cannot create subfolder ({e})", file=sys.stderr, flush=True)
+                print(f"  row {job['row']} ({tag}): cannot create subfolder ({public_text(e)})", file=sys.stderr, flush=True)
                 problems.append(f"sheet {tag}: cannot create Drive folder")
                 titles[tag] = title
                 continue
@@ -699,12 +752,20 @@ def is_blocked_page(body_text):
     return any(m in low for m in BLOCKED_MARKERS)
 
 
+def looks_like_ranked_list(body_text):
+    """Bestseller pages show rank badges like '#1' and '#2'."""
+    return len(re.findall(r"#\s?\d{1,3}\b", body_text or "")) >= 2
+
+
 def is_allowed_url(url):
     """Only public web pages: http(s), not localhost or private addresses."""
-    m = re.match(r"^https?://(?:[^/\s@]*@)?(\[[^\]]+\]|[^/\s:?#]+)", (url or "").strip(), re.I)
+    url = (url or "").strip()
+    if "\\" in url:
+        return False  # browsers read a backslash as a slash
+    m = re.match(r"^https?://(?:[^/\s@]*@)?(\[[^\]]+\]|[^/\s:?#]+)", url, re.I)
     if not m:
         return False
-    host = m.group(1).lower().strip("[]")
+    host = m.group(1).lower().strip("[]").rstrip(".")
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".internal"):
         return False
     import ipaddress
@@ -737,7 +798,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     print(f"[{sheet_label}] {row['category'][:60]} / {row['country']}", flush=True)
 
     if not is_allowed_url(url):
-        raise RowError(f"not an http(s) URL: {url[:80]}")
+        raise RowError("not an http(s) URL (check the sheet's URL column)")
 
     try:
         body_text = await _load(page, url)
@@ -752,6 +813,11 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         raise RowError("blocked/throttled by the site")
 
     if keyword.lower() not in body_text.lower():
+        if not looks_like_ranked_list(body_text):
+            # Not a normal bestseller list (changed layout, redirect, error
+            # page): an error, so it alerts and is retried, instead of a
+            # quiet "not found".
+            raise RowError("page does not look like a bestseller list")
         print("  keyword not found", flush=True)
         return False
 
@@ -766,7 +832,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         )
         await page.wait_for_timeout(300)
     except Exception as e:
-        print(f"  zoom failed: {e}", flush=True)
+        print(f"  zoom failed: {public_text(e)}", flush=True)
 
     try:
         await page.get_by_text(keyword, exact=False).first.scroll_into_view_if_needed(
@@ -784,7 +850,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     try:
         png = add_meta_banner(add_url_banner(raw_png, page.url), row["category"], captured_at)
     except Exception as e:
-        print(f"  banner failed ({e}); uploading without it", flush=True)
+        print(f"  banner failed ({public_text(e)}); uploading without it", flush=True)
         png = raw_png
     ts = captured_at.strftime("%Y%m%d-%H%M%S")
     name = f"{ts}_{row_suffix(row)}"
@@ -804,7 +870,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
                 )
                 print(f"  {status}", flush=True)
             except Exception as e:
-                print(f"  filtered rank update failed: {e}", flush=True)
+                print(f"  filtered rank update failed: {public_text(e)}", flush=True)
 
     return True
 
@@ -841,7 +907,7 @@ async def cmd_run(matrix_entry):
         title = get_sheet_title(sheets_service, sheet_id)
     except Exception:
         title = label
-    rows = read_data_sheet(sheets_service, sheet_id)[start:end]
+    rows = load_rows(sheets_service, sheet_id)[start:end]
     last = start + len(rows)  # the sheet may have shrunk since dispatch
     print(f"=== Sheet '{label}' rows {start + 1}-{last} ===", flush=True)
     if not rows:
@@ -852,17 +918,23 @@ async def cmd_run(matrix_entry):
         done = set() if force else taken_since(drive_service, drive_folder_id, hour_key_start(hkey))
     except Exception as e:
         done = set()
-        print(f"::warning::could not list this hour's screenshots (no row skipping): {e}", flush=True)
+        print(f"::warning::could not list this hour's screenshots (no row skipping): {public_text(e)}", flush=True)
 
     found = 0
     not_found = 0
     skipped = 0
+    deferred = 0
     errors = []
+    started = time.monotonic()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(viewport=VIEWPORT)
         page = await context.new_page()
         for i, row in enumerate(rows, start=start + 1):
+            if time.monotonic() - started > RUN_BUDGET_S:
+                deferred = last - i + 1
+                print(f"::warning::time budget used; {deferred} rows left for the next run", flush=True)
+                break
             if row_suffix(row) in done:
                 # Already captured this hour (an earlier run that was cut off,
                 # or a duplicate row in the sheet).
@@ -876,7 +948,7 @@ async def cmd_run(matrix_entry):
                     not_found += 1
             except Exception as e:
                 errors.append(f"row {i}: {e}")
-                print(f"  ERROR row {i}: {e}", flush=True)
+                print(f"  ERROR row {i}: {public_text(e)}", flush=True)
                 # A fresh page after any failure, so one stuck or crashed
                 # page can't take down the rest of the chunk.
                 try:
@@ -888,14 +960,21 @@ async def cmd_run(matrix_entry):
 
     summary = summarize(label, start, last, found, not_found, errors, skipped)
     print(f"Done: {summary}", flush=True)
+    if deferred:
+        summary += f", {deferred} left for the next run"
+        notify_slack(f":warning: Screenshots for {title}: {summary} (the time budget ran out; "
+                     f"the next run this hour continues if the hour is in run_hours).")
     for err in errors[:20]:
-        print(f"  - {err}", flush=True)
+        print(f"  - {public_text(err)}", flush=True)
     if errors:
         notify_slack(f":warning: Screenshots for {title}: {summary}. First error: {errors[0][:200]}")
+    elif found == 0 and not_found > 0:
+        notify_slack(f":warning: Screenshots for {title}: {summary}. The book was not found on any page "
+                     f"in this chunk; check the sheet's keywords or Amazon's pages.")
     if should_fail(found, errors, found + not_found + len(errors)):
         print("::error::" + summary, flush=True)
         sys.exit(1)
-    if errors:
+    if errors or deferred:
         # No marker: the next trigger this hour retries this chunk, and
         # skips the rows that already have a screenshot.
         print("::warning::" + summary, flush=True)
@@ -903,7 +982,7 @@ async def cmd_run(matrix_entry):
     try:
         mark_chunk_done(drive_service, markers_id, sheet_id, hkey, start, end, summary)
     except Exception as e:
-        print(f"::warning::could not write done-marker: {e}", flush=True)
+        print(f"::warning::could not write done-marker: {public_text(e)}", flush=True)
         notify_slack(f":warning: Screenshot chunk done but its marker failed ({title}): {e}")
 
 
@@ -918,12 +997,19 @@ def main():
                        help="matrix entry from dispatch (default: $MATRIX_JOB)")
 
     args = parser.parse_args()
-    if args.cmd == "dispatch":
-        cmd_dispatch()
-    elif args.cmd == "run":
-        if not args.job:
-            parser.error("run needs --job or MATRIX_JOB")
-        asyncio.run(cmd_run(args.job))
+    if args.cmd == "run" and not args.job:
+        parser.error("run needs --job or MATRIX_JOB")
+    try:
+        if args.cmd == "dispatch":
+            cmd_dispatch()
+        else:
+            asyncio.run(cmd_run(args.job))
+    except SystemExit:
+        raise
+    except Exception as e:
+        # No raw traceback in the public log: error class and filtered text.
+        print(f"::error::{type(e).__name__}: {public_text(e)}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
