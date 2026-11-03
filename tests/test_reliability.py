@@ -324,7 +324,7 @@ def test_process_row_uploads_and_updates_filtered():
 
 
 def test_process_row_keyword_missing_returns_false():
-    page = FakePage(["nothing here"])
+    page = FakePage(["#1 Other Book #2 Another Book"])
     assert asyncio.run(sr.process_row(page, ROW, FakeDrive(), "main", "filt", "L")) is False
 
 
@@ -589,6 +589,45 @@ def test_run_stops_at_time_budget_and_leaves_no_marker(monkeypatch):
 
 def test_run_with_no_book_found_still_marks_done(monkeypatch):
     rows = [["Fiction", "https://a/1", "US", "Some Book"]]
-    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "other books only"})
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Other Book #2 Another Book"})
     asyncio.run(sr.cmd_run(entry))
     assert sr.chunk_done(drive, "mk", "S", hkey, 0, 1)
+
+
+# ---------- reaudit round 2 ----------
+
+def test_public_text_hides_schemeless_links_and_drive_queries():
+    assert "Book" not in sr.public_text("goto www.amazon.com/Book-Title/dp/1 failed")
+    t = sr.public_text('<HttpError 500 when requesting https://www.googleapis.com/drive/v3/files?q=name%3D%27Book_Title%27 returned "x">')
+    assert "Book_Title" not in t
+    assert "Book_Title" not in sr.public_text("bad request q=name='Book_Title' and x")
+
+
+def test_update_filtered_best_removes_extra_entries_from_parallel_chunks():
+    import hashlib
+    drive = FakeDrive()
+    f = drive.files()
+    url = "https://www.amazon.com/x"
+    key = hashlib.sha1(url.encode()).hexdigest()[:10]
+    a = f.add(f"rank0003_{key}_a.png", "filt")
+    f.add(f"rank0005_{key}_b.png", "filt")
+    f.add(f"rank0003_{key}_c.png", "filt")
+    row = {"category": "F", "country": "US", "keyword": "B"}
+    sr.update_filtered_best(drive, "filt", url, row, 7, "ts", b"png")
+    left = [(i, v["name"]) for i, v in f.files.items()]
+    assert len(left) == 1 and left[0][1].startswith("rank0003_")
+
+
+def test_process_row_non_list_page_is_an_error():
+    page = FakePage(["Welcome to the new Amazon homepage"])
+    with pytest.raises(sr.RowError):
+        asyncio.run(sr.process_row(page, ROW, FakeDrive(), "main", "", "L"))
+
+
+def test_chunk_rows_is_capped(monkeypatch):
+    sheets = FakeSheets({
+        ("ctl", "Jobs!A:D"): [["h"]],
+        ("ctl", "Settings!A:B"): [["k", "v"], ["chunk_rows", "1000"]],
+    })
+    _, settings = sr.read_control_sheet(sheets, "ctl")
+    assert settings["chunk_rows"] == sr.MAX_CHUNK_ROWS

@@ -47,9 +47,10 @@ DEFAULT_RUN_HOURS = [9, 19]
 # the job's timeout. Override with Settings!chunk_rows in the control sheet.
 DEFAULT_CHUNK_ROWS = 120
 # Stop starting new rows after this many seconds, well before the job's
-# 45-minute timeout, so a chunk slowed down by blocked pages still ends
+# 45-minute timeout (setup runs first), so a chunk slowed down by blocked pages still ends
 # cleanly; the next trigger this hour picks up the rest.
-RUN_BUDGET_S = 38 * 60
+RUN_BUDGET_S = 33 * 60  # plus ~5 min setup and one slow row stays under 45
+MAX_CHUNK_ROWS = 200  # larger chunks risk the job timeout
 MAX_MATRIX_JOBS = 256  # GitHub's limit per workflow run
 # Read-only Drive/Sheets calls are safe to retry. Uploads are not (a retry
 # after a timeout can create a second file), see upload_to_drive.
@@ -91,6 +92,10 @@ def public_text(value, limit=300):
     """Text safe for the public run logs: URLs (which can carry book titles)
     are replaced, and long messages cut."""
     text = re.sub(r"https?://\S+", "<url>", str(value))
+    # Links written without a scheme (www.amazon.com/Book-Title/...).
+    text = re.sub(r"\b(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?/\S*", "<url>", text, flags=re.I)
+    # Drive/Sheets query strings name files (category, country, book title).
+    text = re.sub(r"\bq=\S+", "q=<query>", text)
     return text[:limit]
 
 
@@ -114,7 +119,7 @@ def notify_slack(text):
         urllib.request.urlopen(req, timeout=20).read()
         return True
     except Exception as e:
-        print(f"  slack notify failed: {e}", file=sys.stderr, flush=True)
+        print(f"  slack notify failed: {public_text(e)}", file=sys.stderr, flush=True)
         return False
 
 
@@ -175,7 +180,7 @@ def upload_to_drive(drive_service, folder_id, name, data, sleep=None):
                 existing = find_file_by_name(drive_service, folder_id, name)
             except Exception as e:
                 existing = None
-                print(f"  upload check failed: {e}", flush=True)
+                print(f"  upload check failed: {public_text(e)}", flush=True)
             if existing:
                 return existing
         try:
@@ -339,6 +344,12 @@ def update_filtered_best(drive_service, filtered_folder_id, url, row, rank, ts, 
     existing = find_filtered_entries(drive_service, filtered_folder_id, url_key)
     best_existing_rank = min((r for _, r in existing), default=None)
     if best_existing_rank is not None and rank >= best_existing_rank:
+        # Two chunks running at once can each upload a "best" for the same
+        # URL; keep one file at the best rank and remove the rest.
+        keep = next(fid for fid, r in existing if r == best_existing_rank)
+        for file_id, _ in existing:
+            if file_id != keep:
+                delete_from_drive(drive_service, file_id)
         return f"rank #{rank} not better than existing best #{best_existing_rank}; skipping filtered upload"
     filtered_name = f"rank{rank:04d}_{url_key}_{readable}_{ts}.png"
     new_id = upload_to_drive(drive_service, filtered_folder_id, filtered_name, png)
@@ -426,7 +437,7 @@ def read_control_sheet(sheets_service, control_id):
             start = datetime.strptime(start_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             stop = datetime.strptime(stop_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
         except Exception as e:
-            print(f"  Jobs row {i}: bad date/timezone ({e})", file=sys.stderr, flush=True)
+            print(f"  Jobs row {i}: bad date/timezone ({public_text(e)})", file=sys.stderr, flush=True)
             continue
         jobs.append(
             {
@@ -459,11 +470,11 @@ def read_control_sheet(sheets_service, control_id):
                     else:
                         print(f"::error::run_hours '{val}' has no valid hour; using {settings['run_hours']}", flush=True)
                 elif key == "chunk_rows":
-                    settings["chunk_rows"] = max(10, int(val))
+                    settings["chunk_rows"] = min(MAX_CHUNK_ROWS, max(10, int(val)))
             except ValueError as e:
-                print(f"  bad {key} value '{val}': {e}", file=sys.stderr, flush=True)
+                print(f"  bad {key} value '{val}': {public_text(e)}", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"  could not read Settings tab (using defaults): {e}", file=sys.stderr, flush=True)
+        print(f"  could not read Settings tab (using defaults): {public_text(e)}", file=sys.stderr, flush=True)
 
     return jobs, settings
 
@@ -734,6 +745,11 @@ def is_blocked_page(body_text):
     return any(m in low for m in BLOCKED_MARKERS)
 
 
+def looks_like_ranked_list(body_text):
+    """Bestseller pages show rank badges like '#1' and '#2'."""
+    return len(re.findall(r"#\s?\d{1,3}\b", body_text or "")) >= 2
+
+
 def is_allowed_url(url):
     """Only public web pages: http(s), not localhost or private addresses."""
     url = (url or "").strip()
@@ -790,6 +806,11 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         raise RowError("blocked/throttled by the site")
 
     if keyword.lower() not in body_text.lower():
+        if not looks_like_ranked_list(body_text):
+            # Not a normal bestseller list (changed layout, redirect, error
+            # page): an error, so it alerts and is retried, instead of a
+            # quiet "not found".
+            raise RowError("page does not look like a bestseller list")
         print("  keyword not found", flush=True)
         return False
 
@@ -804,7 +825,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         )
         await page.wait_for_timeout(300)
     except Exception as e:
-        print(f"  zoom failed: {e}", flush=True)
+        print(f"  zoom failed: {public_text(e)}", flush=True)
 
     try:
         await page.get_by_text(keyword, exact=False).first.scroll_into_view_if_needed(
@@ -822,7 +843,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     try:
         png = add_meta_banner(add_url_banner(raw_png, page.url), row["category"], captured_at)
     except Exception as e:
-        print(f"  banner failed ({e}); uploading without it", flush=True)
+        print(f"  banner failed ({public_text(e)}); uploading without it", flush=True)
         png = raw_png
     ts = captured_at.strftime("%Y%m%d-%H%M%S")
     name = f"{ts}_{row_suffix(row)}"
@@ -842,7 +863,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
                 )
                 print(f"  {status}", flush=True)
             except Exception as e:
-                print(f"  filtered rank update failed: {e}", flush=True)
+                print(f"  filtered rank update failed: {public_text(e)}", flush=True)
 
     return True
 
@@ -890,7 +911,7 @@ async def cmd_run(matrix_entry):
         done = set() if force else taken_since(drive_service, drive_folder_id, hour_key_start(hkey))
     except Exception as e:
         done = set()
-        print(f"::warning::could not list this hour's screenshots (no row skipping): {e}", flush=True)
+        print(f"::warning::could not list this hour's screenshots (no row skipping): {public_text(e)}", flush=True)
 
     found = 0
     not_found = 0
@@ -952,7 +973,7 @@ async def cmd_run(matrix_entry):
     try:
         mark_chunk_done(drive_service, markers_id, sheet_id, hkey, start, end, summary)
     except Exception as e:
-        print(f"::warning::could not write done-marker: {e}", flush=True)
+        print(f"::warning::could not write done-marker: {public_text(e)}", flush=True)
         notify_slack(f":warning: Screenshot chunk done but its marker failed ({title}): {e}")
 
 
