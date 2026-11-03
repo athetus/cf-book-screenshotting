@@ -638,7 +638,7 @@ def cmd_dispatch():
                 title = get_sheet_title(sheets_service, job["sheet_id"])
                 n_rows = len(load_rows(sheets_service, job["sheet_id"]))
             except Exception as e:
-                print(f"  row {job['row']}: cannot read sheet ({e})", file=sys.stderr, flush=True)
+                print(f"  row {job['row']}: cannot read sheet ({public_text(e)})", file=sys.stderr, flush=True)
                 problems.append(f"control row {job['row']}: cannot read data sheet")
                 continue
             try:
@@ -647,7 +647,7 @@ def cmd_dispatch():
                     drive_service, drive_folder_id, f"{title} filtered"
                 )
             except Exception as e:
-                print(f"  row {job['row']} ({tag}): cannot create subfolder ({e})", file=sys.stderr, flush=True)
+                print(f"  row {job['row']} ({tag}): cannot create subfolder ({public_text(e)})", file=sys.stderr, flush=True)
                 problems.append(f"sheet {tag}: cannot create Drive folder")
                 titles[tag] = title
                 continue

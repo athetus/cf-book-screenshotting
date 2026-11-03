@@ -41,6 +41,8 @@ jobs:
         run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/screenshot.yml/enable"
 
   dispatch:
+    # The weekly keepalive schedule only re-enables the workflow.
+    if: github.event.schedule != '50 3 * * 1'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
