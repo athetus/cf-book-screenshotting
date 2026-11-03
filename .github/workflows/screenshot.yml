@@ -4,7 +4,7 @@ on:
   schedule:
     # Hourly. Minute 35 avoids GitHub's busiest minute (:00, where scheduled
     # runs are often dropped) and lands inside the same Asia/Kolkata hour as
-    # the external :30 trigger. Each finished chunk leaves a marker in Drive
+    # an external trigger at :40. Each finished chunk leaves a marker in Drive
     # for its local hour and later runs skip it, so both triggers can stay on.
     - cron: "35 * * * *"
     # Weekly keepalive (see the keepalive job): GitHub switches off scheduled
