@@ -23,7 +23,7 @@ Takes bestseller-rank proof screenshots of Amazon category pages and saves them 
 
 ## Triggers
 - GitHub schedule at minute 35 every hour (GitHub may delay or skip these).
-- Weekly keepalive (Monday 03:50 UTC): re-enables the workflow so GitHub's 60-day inactivity switch-off for public repos never applies. An external caller can also send `PUT /repos/<owner>/<repo>/actions/workflows/screenshot.yml/enable` weekly as a backup.
+- Weekly keepalive (Monday 03:50 UTC): re-enables the workflow against GitHub's 60-day inactivity switch-off for public repos. It rides on GitHub's own schedule, which can skip runs, so have the external caller also send `PUT /repos/<owner>/<repo>/actions/workflows/screenshot.yml/enable` weekly.
 - Optional external hourly trigger: `POST /repos/<owner>/<repo>/actions/workflows/screenshot.yml/dispatches` with `{"ref":"main"}`.
 
 ## Local test

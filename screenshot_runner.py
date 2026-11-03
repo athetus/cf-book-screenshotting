@@ -65,6 +65,7 @@ BLOCKED_MARKERS = (
     "sorry, we just need to make sure you're not a robot",
     "request was throttled",
     "to discuss automated access to amazon data",
+    "click the button below to continue shopping",
 )
 MATRIX_SEP = "|"
 # Drive folder (inside DRIVE_FOLDER_ID) holding one small marker file per
@@ -91,11 +92,17 @@ def extract_sheet_id(url_or_id):
 def public_text(value, limit=300):
     """Text safe for the public run logs: URLs (which can carry book titles)
     are replaced, and long messages cut."""
-    text = re.sub(r"https?://\S+", "<url>", str(value))
+    text = str(value)
+    # Playwright puts the whole URL in quotes ("navigating to \"...\""),
+    # and a URL can contain spaces: hide quoted URLs whole first.
+    text = re.sub(r"([\"'])https?://.*?\1", r"\1<url>\1", text)
+    text = re.sub(r"https?://\S+", "<url>", text)
     # Links written without a scheme (www.amazon.com/Book-Title/...).
     text = re.sub(r"\b(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?/\S*", "<url>", text, flags=re.I)
     # Drive/Sheets query strings name files (category, country, book title).
     text = re.sub(r"\bq=\S+", "q=<query>", text)
+    # Quoted names in Drive/Sheets errors (name contains 'Book Title').
+    text = re.sub(r"'[^']{3,}'", "'<text>'", text)
     return text[:limit]
 
 
@@ -791,7 +798,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     print(f"[{sheet_label}] {row['category'][:60]} / {row['country']}", flush=True)
 
     if not is_allowed_url(url):
-        raise RowError(f"not an http(s) URL: {url[:80]}")
+        raise RowError("not an http(s) URL (check the sheet's URL column)")
 
     try:
         body_text = await _load(page, url)
@@ -955,6 +962,8 @@ async def cmd_run(matrix_entry):
     print(f"Done: {summary}", flush=True)
     if deferred:
         summary += f", {deferred} left for the next run"
+        notify_slack(f":warning: Screenshots for {title}: {summary} (the time budget ran out; "
+                     f"the next run this hour continues if the hour is in run_hours).")
     for err in errors[:20]:
         print(f"  - {public_text(err)}", flush=True)
     if errors:
@@ -988,12 +997,19 @@ def main():
                        help="matrix entry from dispatch (default: $MATRIX_JOB)")
 
     args = parser.parse_args()
-    if args.cmd == "dispatch":
-        cmd_dispatch()
-    elif args.cmd == "run":
-        if not args.job:
-            parser.error("run needs --job or MATRIX_JOB")
-        asyncio.run(cmd_run(args.job))
+    if args.cmd == "run" and not args.job:
+        parser.error("run needs --job or MATRIX_JOB")
+    try:
+        if args.cmd == "dispatch":
+            cmd_dispatch()
+        else:
+            asyncio.run(cmd_run(args.job))
+    except SystemExit:
+        raise
+    except Exception as e:
+        # No raw traceback in the public log: error class and filtered text.
+        print(f"::error::{type(e).__name__}: {public_text(e)}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

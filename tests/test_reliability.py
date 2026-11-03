@@ -631,3 +631,34 @@ def test_chunk_rows_is_capped(monkeypatch):
     })
     _, settings = sr.read_control_sheet(sheets, "ctl")
     assert settings["chunk_rows"] == sr.MAX_CHUNK_ROWS
+
+
+# ---------- reaudit round 3 ----------
+
+def test_public_text_hides_quoted_url_with_spaces_and_quoted_names():
+    t = sr.public_text('Page.goto: Timeout navigating to "https://www.amazon.com/gp/x/Secret Book Title/ref=x"')
+    assert "Secret" not in t and "Book Title" not in t
+    t = sr.public_text("Invalid query: name contains 'Secret Book' and parents")
+    assert "Secret Book" not in t
+
+
+def test_soft_block_page_is_detected():
+    assert sr.is_blocked_page("Click the button below to continue shopping")
+
+
+def test_bad_url_error_does_not_echo_cell():
+    row = dict(ROW, url="My Secret Book Title - Kindle")
+    with pytest.raises(sr.RowError) as e:
+        asyncio.run(sr.process_row(FakePage(["x"]), row, FakeDrive(), "main", "", "L"))
+    assert "Secret" not in str(e.value)
+
+
+def test_main_prints_filtered_error_not_traceback(monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("failed https://www.googleapis.com/drive/v3/files?q=name='Secret Book'")
+    monkeypatch.setattr(sr, "cmd_dispatch", boom)
+    monkeypatch.setattr(sr.sys, "argv", ["screenshot_runner.py", "dispatch"])
+    with pytest.raises(SystemExit):
+        sr.main()
+    out = capsys.readouterr()
+    assert "Secret" not in out.out + out.err and "Traceback" not in out.out + out.err
