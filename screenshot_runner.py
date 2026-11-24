@@ -41,6 +41,7 @@ SCOPES = [
 
 VIEWPORT = {"width": 1440, "height": 900}
 NAV_TIMEOUT_MS = 45000
+PAGE_CLOSE_TIMEOUT_S = 15  # closing a stuck page must not stall the chunk
 EVAL_TIMEOUT_S = 60  # page.evaluate on a hung page must not stall the chunk
 ROW_TIMEOUT_S = 240  # whole-row ceiling (two loads, a block retry, screenshot, upload)
 POST_LOAD_WAIT_MS = 2500
@@ -781,6 +782,11 @@ def keyword_pattern(keyword):
             out.append("['\u2018\u2019\u201a\u201b\u2032\u02bc]")
         elif ch == '"':
             out.append('["\u201c\u201d\u201e\u201f\u2033]')
+        elif ch.isspace():
+            # Like get_by_text(str): any run of whitespace (line break, nbsp,
+            # double spaces) matches. Adjacent whitespace chars collapse.
+            if not out or out[-1] != r"\s+":
+                out.append(r"\s+")
         else:
             out.append(re.escape(ch))
     return re.compile("".join(out), re.I)
@@ -1008,7 +1014,7 @@ async def cmd_run(matrix_entry):
                 # A fresh page after any failure, so one stuck or crashed
                 # page can't take down the rest of the chunk.
                 try:
-                    await asyncio.wait_for(page.close(), 15)
+                    await asyncio.wait_for(page.close(), PAGE_CLOSE_TIMEOUT_S)
                 except Exception:
                     pass
                 page = await context.new_page()

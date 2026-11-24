@@ -724,24 +724,88 @@ def test_process_row_finds_keyword_with_curly_apostrophe():
     assert asyncio.run(sr.process_row(page, row, FakeDrive(), "main", "", "L")) is True
 
 
+VALID_PAGE = "#1 Some Book #2 Another Book"
+
+
 def test_process_row_hung_evaluate_is_row_error(monkeypatch):
+    # After the hang the page would look fine, so only the timeout can fail the row.
     class Hung(FakePage):
         async def evaluate(self, js, *args):
-            await asyncio.sleep(5)
+            await asyncio.sleep(0.5)
+            return VALID_PAGE
 
     monkeypatch.setattr(sr, "EVAL_TIMEOUT_S", 0.05)
-    with pytest.raises(sr.RowError):
+    with pytest.raises(sr.RowError, match="load failed"):
         asyncio.run(sr.process_row(Hung(["x"]), ROW, FakeDrive(), "main", "", "L"))
 
 
 def test_run_row_with_hung_row_times_out_as_row_error(monkeypatch):
     class Slow(FakePage):
         async def goto(self, url, **kw):
-            await asyncio.sleep(5)
+            await asyncio.sleep(0.5)
 
     monkeypatch.setattr(sr, "ROW_TIMEOUT_S", 0.05)
-    with pytest.raises(sr.RowError):
-        asyncio.run(sr.process_row_limited(Slow(["x"]), ROW, FakeDrive(), "main", "", "L"))
+    with pytest.raises(sr.RowError, match=r"row timed out after 0\.05 s"):
+        asyncio.run(sr.process_row_limited(Slow([VALID_PAGE]), ROW, FakeDrive(), "main", "", "L"))
+
+
+def test_process_row_zoom_hang_times_out_and_row_still_succeeds(monkeypatch, capsys):
+    class ZoomHang(FakePage):
+        async def evaluate(self, js, *args):
+            if "zoom" in js:
+                await asyncio.sleep(30)
+            return await super().evaluate(js, *args)
+
+    async def go():
+        return await asyncio.wait_for(
+            sr.process_row(ZoomHang([VALID_PAGE]), ROW, FakeDrive(), "main", "", "L"), 5
+        )
+
+    monkeypatch.setattr(sr, "EVAL_TIMEOUT_S", 0.05)
+    assert asyncio.run(go()) is True
+    assert "zoom failed" in capsys.readouterr().out
+
+
+def test_run_page_close_hang_does_not_stall_the_chunk(monkeypatch, capsys):
+    class HangClose(_RunPage):
+        async def close(self):
+            await asyncio.sleep(30)
+
+    class Ctx(_FakeContext):
+        async def new_page(self):
+            self.pages += 1
+            return HangClose(self._texts)
+
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "RAISE", "https://a/2": "#1 Some Book"})
+    monkeypatch.setattr(sr, "async_playwright", _fake_playwright(Ctx({"https://a/1": "RAISE", "https://a/2": "#1 Some Book"})))
+    monkeypatch.setattr(sr, "PAGE_CLOSE_TIMEOUT_S", 0.05)
+    asyncio.run(asyncio.wait_for(sr.cmd_run(entry), 5))
+    assert len(_pngs(drive, "main")) == 1
+
+
+def test_run_summary_includes_not_found_rows(monkeypatch, capsys):
+    monkeypatch.setattr(sr, "notify_slack", lambda t: None)
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Some Book", "https://a/2": "#1 Other #2 More"})
+    asyncio.run(sr.cmd_run(entry))
+    assert "not found: row 2" in capsys.readouterr().out
+
+
+def test_keyword_pattern_collapses_whitespace_like_playwright_text_match():
+    pat = sr.keyword_pattern("Some Book  Title")
+    assert pat.search("#1 Some\nBook Title")
+    assert pat.search("#1 Some\u00a0Book\u00a0\u00a0Title")
+    assert pat.search("#1 Some   Book \n Title")
+    assert not pat.search("#1 SomeBook Title")
+    assert not pat.search("#1 Other Book Title")
+
+
+def test_keyword_pattern_keeps_quotes_case_and_escaping():
+    pat = sr.keyword_pattern("Bob's \"Book\" (2)")
+    assert pat.search("bob\u2019s \u201cbook\u201d (2)")
+    assert pat.search("BOB'S \"BOOK\" (2)")
+    assert not pat.search("Bobs Book 2")
 
 
 def test_summary_lists_not_found_rows_without_alerting(monkeypatch):
