@@ -20,7 +20,7 @@ import socket
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
@@ -545,14 +545,13 @@ def row_suffix(row):
     )
 
 
-def taken_since(drive_service, folder_id, since_utc):
-    """Name suffixes (see row_suffix) of screenshots in folder_id created
-    since since_utc, so a re-run in the same hour skips rows already done."""
+def files_since(drive_service, folder_id, since_utc):
+    """Names of all files in folder_id created since since_utc."""
     q = (
         f"'{folder_id}' in parents and trashed = false and "
         f"createdTime >= '{since_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
     )
-    out = set()
+    out = []
     page_token = None
     while True:
         kwargs = dict(
@@ -565,12 +564,17 @@ def taken_since(drive_service, folder_id, since_utc):
         if page_token:
             kwargs["pageToken"] = page_token
         res = drive_service.files().list(**kwargs).execute(num_retries=READ_RETRIES)
-        for f in res.get("files", []):
-            if len(f["name"]) > TS_PREFIX_LEN:
-                out.add(f["name"][TS_PREFIX_LEN:])
+        out.extend(f["name"] for f in res.get("files", []))
         page_token = res.get("nextPageToken")
         if not page_token:
             return out
+
+
+def taken_since(drive_service, folder_id, since_utc):
+    """Name suffixes (see row_suffix) of screenshots in folder_id created
+    since since_utc, so a re-run in the same hour skips rows already done."""
+    return {n[TS_PREFIX_LEN:] for n in files_since(drive_service, folder_id, since_utc)
+            if len(n) > TS_PREFIX_LEN}
 
 
 def marker_name(sheet_id, hour_key_, start, end):
@@ -585,14 +589,75 @@ def mark_chunk_done(drive_service, markers_id, sheet_id, hour_key_, start, end, 
     """Record in Drive that this chunk was done for this local hour, so a
     second trigger in the same hour (or a retry after another chunk failed)
     skips it instead of taking the same screenshots again."""
-    name = marker_name(sheet_id, hour_key_, start, end)
-    media = MediaIoBaseUpload(io.BytesIO(summary.encode("utf-8")), mimetype="text/plain", resumable=False)
+    write_marker(drive_service, markers_id, marker_name(sheet_id, hour_key_, start, end), summary)
+
+
+def write_marker(drive_service, markers_id, name, text):
+    media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=False)
     drive_service.files().create(
         body={"name": name, "parents": [markers_id]},
         media_body=media,
         fields="id",
         supportsAllDrives=True,
     ).execute()
+
+
+# ---------- daily digest ----------
+
+DIGEST_TZ = ZoneInfo("Asia/Kolkata")
+DIGEST_HOUR = 9  # first dispatch at or after 09:00 IST posts the digest
+DIGEST_ALERT_AFTER = timedelta(hours=3)
+
+
+def expected_runs(job, run_hours, now_utc):
+    """How many of the job's run-hours inside its window fell in the last 24 h."""
+    count = 0
+    for k in range(24):
+        t = local_hour_start(now_utc.astimezone(job["tz"])) - timedelta(hours=k)
+        if t.hour in run_hours and job["start"] <= t <= job["stop"] and t > now_utc - timedelta(hours=24):
+            count += 1
+    return count
+
+
+def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_hours, now_utc):
+    """Post one Slack message per IST day listing, for each book whose window
+    is open, the screenshots saved in the last 24 h against what was expected.
+    Returns True if a message went out. Raises on Drive/Sheets errors; the
+    caller decides that a digest failure never stops dispatch."""
+    now_ist = now_utc.astimezone(DIGEST_TZ)
+    if now_ist.hour < DIGEST_HOUR:
+        return False
+    open_jobs = []
+    seen = set()
+    for job in jobs:
+        if job["start"] <= now_utc <= job["stop"] and job["sheet_id"] not in seen:
+            seen.add(job["sheet_id"])
+            open_jobs.append(job)
+    if not open_jobs:
+        return False
+    markers_id = find_or_create_subfolder(drive_service, drive_folder_id, MARKERS_FOLDER)
+    marker = f"digest_{now_ist.strftime('%Y%m%d')}"
+    if find_file_by_name(drive_service, markers_id, marker):
+        return False
+    since = now_utc - timedelta(hours=24)
+    lines = []
+    for job in open_jobs:
+        title = get_sheet_title(sheets_service, job["sheet_id"])
+        n_rows = len(load_rows(sheets_service, job["sheet_id"]))
+        folder_id = find_or_create_subfolder(drive_service, drive_folder_id, title)
+        saved = len(files_since(drive_service, folder_id, since))
+        expected = expected_runs(job, run_hours, now_utc) * n_rows
+        line = f"{title}: {saved} screenshots saved in the last 24 h (expected about {expected})"
+        if saved == 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
+            line = f":warning: {line} - NO screenshots yet"
+        lines.append(line)
+    if not notify_slack("Daily screenshot digest\n" + "\n".join(lines)):
+        return False  # not marked, so the next trigger tries again
+    try:
+        write_marker(drive_service, markers_id, marker, now_ist.isoformat())
+    except Exception as e:
+        print(f"::warning::digest marker not written ({public_text(e)}); it may repeat today", flush=True)
+    return True
 
 
 def cmd_dispatch():
@@ -706,6 +771,12 @@ def cmd_dispatch():
                 f"{len(active)} chunks exceed GitHub's {MAX_MATRIX_JOBS}; raise chunk_rows"
             )
             del active[MAX_MATRIX_JOBS:]
+
+        try:
+            post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs,
+                              run_hours, datetime.now(timezone.utc))
+        except Exception as e:
+            print(f"::warning::daily digest failed ({public_text(e)})", flush=True)
 
         print(f"Active chunks to dispatch: {len(active)}", flush=True)
         if problems:
