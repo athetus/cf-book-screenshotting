@@ -20,7 +20,7 @@ import socket
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
@@ -135,7 +135,8 @@ def notify_slack(text):
 
 # ---------- Drive ----------
 
-def find_or_create_subfolder(drive_service, parent_id, name):
+def find_subfolder(drive_service, parent_id, name):
+    """Id of the named folder under parent_id, or None. Never creates one."""
     q = (
         f"name = '{_drive_quote(name)}' "
         f"and mimeType = 'application/vnd.google-apps.folder' "
@@ -147,8 +148,13 @@ def find_or_create_subfolder(drive_service, parent_id, name):
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
     ).execute(num_retries=READ_RETRIES)
-    if res.get("files"):
-        return res["files"][0]["id"]
+    return res["files"][0]["id"] if res.get("files") else None
+
+
+def find_or_create_subfolder(drive_service, parent_id, name):
+    found = find_subfolder(drive_service, parent_id, name)
+    if found:
+        return found
     created = drive_service.files().create(
         body={
             "name": name,
@@ -545,14 +551,13 @@ def row_suffix(row):
     )
 
 
-def taken_since(drive_service, folder_id, since_utc):
-    """Name suffixes (see row_suffix) of screenshots in folder_id created
-    since since_utc, so a re-run in the same hour skips rows already done."""
+def files_since(drive_service, folder_id, since_utc):
+    """Names of all files in folder_id created since since_utc."""
     q = (
         f"'{folder_id}' in parents and trashed = false and "
         f"createdTime >= '{since_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
     )
-    out = set()
+    out = []
     page_token = None
     while True:
         kwargs = dict(
@@ -565,12 +570,17 @@ def taken_since(drive_service, folder_id, since_utc):
         if page_token:
             kwargs["pageToken"] = page_token
         res = drive_service.files().list(**kwargs).execute(num_retries=READ_RETRIES)
-        for f in res.get("files", []):
-            if len(f["name"]) > TS_PREFIX_LEN:
-                out.add(f["name"][TS_PREFIX_LEN:])
+        out.extend(f["name"] for f in res.get("files", []))
         page_token = res.get("nextPageToken")
         if not page_token:
             return out
+
+
+def taken_since(drive_service, folder_id, since_utc):
+    """Name suffixes (see row_suffix) of screenshots in folder_id created
+    since since_utc, so a re-run in the same hour skips rows already done."""
+    return {n[TS_PREFIX_LEN:] for n in files_since(drive_service, folder_id, since_utc)
+            if len(n) > TS_PREFIX_LEN}
 
 
 def marker_name(sheet_id, hour_key_, start, end):
@@ -585,8 +595,11 @@ def mark_chunk_done(drive_service, markers_id, sheet_id, hour_key_, start, end, 
     """Record in Drive that this chunk was done for this local hour, so a
     second trigger in the same hour (or a retry after another chunk failed)
     skips it instead of taking the same screenshots again."""
-    name = marker_name(sheet_id, hour_key_, start, end)
-    media = MediaIoBaseUpload(io.BytesIO(summary.encode("utf-8")), mimetype="text/plain", resumable=False)
+    write_marker(drive_service, markers_id, marker_name(sheet_id, hour_key_, start, end), summary)
+
+
+def write_marker(drive_service, markers_id, name, text):
+    media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=False)
     drive_service.files().create(
         body={"name": name, "parents": [markers_id]},
         media_body=media,
@@ -595,12 +608,95 @@ def mark_chunk_done(drive_service, markers_id, sheet_id, hour_key_, start, end, 
     ).execute()
 
 
+# ---------- daily digest ----------
+
+DIGEST_TZ = ZoneInfo("Asia/Kolkata")
+DIGEST_HOUR = 9  # first dispatch at or after 09:00 IST posts the digest
+DIGEST_ALERT_AFTER = timedelta(hours=3)
+DIGEST_MAX_SECONDS = 90  # skip the remaining books once the digest has run this long
+
+
+def expected_runs(job, run_hours, now_utc):
+    """How many of the job's run-hours inside its window have already finished
+    in the last 24 h. The current local hour is not counted: its screenshots
+    are taken after the dispatch that posts the digest."""
+    count = 0
+    for k in range(1, 24):
+        t = local_hour_start(now_utc.astimezone(job["tz"])) - timedelta(hours=k)
+        if t.hour in run_hours and job["start"] <= t <= job["stop"] and t > now_utc - timedelta(hours=24):
+            count += 1
+    return count
+
+
+def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_hours, now_utc,
+                      max_seconds=DIGEST_MAX_SECONDS, clock=time.monotonic):
+    """Post one Slack message per IST day listing, for each book whose window
+    is open, the screenshots saved in the last 24 h against what was expected.
+    Returns True if a message went out. Raises on Drive/Sheets errors; the
+    caller decides that a digest failure never stops dispatch."""
+    now_ist = now_utc.astimezone(DIGEST_TZ)
+    if now_ist.hour < DIGEST_HOUR:
+        return False
+    open_jobs = []
+    seen = set()
+    for job in jobs:
+        if job["start"] <= now_utc <= job["stop"] and job["sheet_id"] not in seen:
+            seen.add(job["sheet_id"])
+            open_jobs.append(job)
+    if not open_jobs:
+        return False
+    markers_id = find_or_create_subfolder(drive_service, drive_folder_id, MARKERS_FOLDER)
+    marker = f"digest_{now_ist.strftime('%Y%m%d')}"
+    if find_file_by_name(drive_service, markers_id, marker):
+        return False
+    since = now_utc - timedelta(hours=24)
+    started = clock()
+    lines = []
+    for job in open_jobs:
+        tag = job["sheet_id"][:8]
+        if clock() - started > max_seconds:
+            lines.append(f"sheet {tag}: skipped (digest time limit)")
+            continue
+        try:
+            title = get_sheet_title(sheets_service, job["sheet_id"])
+        except Exception as e:
+            print(f"::warning::digest: sheet {tag} could not be read ({public_text(e)})", flush=True)
+            lines.append(f"sheet {tag}: could not check")
+            continue
+        try:
+            n_rows = len(load_rows(sheets_service, job["sheet_id"]))
+            # find only: a book never dispatched has no folder yet, and the digest must not create one
+            folder_id = find_subfolder(drive_service, drive_folder_id, title)
+            saved = len(files_since(drive_service, folder_id, since)) if folder_id else 0
+        except Exception as e:
+            print(f"::warning::digest: sheet {tag} could not be checked ({public_text(e)})", flush=True)
+            lines.append(f"{title}: could not check")
+            continue
+        expected = expected_runs(job, run_hours, now_utc) * n_rows
+        line = f"{title}: {saved} screenshots saved in the last 24 h (expected about {expected})"
+        if saved == 0 and expected > 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
+            line = f":warning: {line} - NO screenshots yet"
+        lines.append(line)
+    if not notify_slack("Daily screenshot digest\n" + "\n".join(lines)):
+        return False  # not marked, so the next trigger tries again
+    try:
+        write_marker(drive_service, markers_id, marker, now_ist.isoformat())
+    except Exception as e:
+        print(f"::warning::digest marker not written ({public_text(e)}); it may repeat today", flush=True)
+    return True
+
+
 def cmd_dispatch():
     output_path = os.environ.get("GITHUB_OUTPUT")
     active = []
     problems = []
 
+    written = []
+
     def write_outputs():
+        if written:
+            return  # outputs are written once, before the digest; finally must not repeat them
+        written.append(True)
         # Matrix must always have at least one entry, otherwise GitHub Actions
         # errors on strategy expansion. Use a sentinel when there's no work.
         matrix_value = active if active else ["__noop__"]
@@ -706,6 +802,14 @@ def cmd_dispatch():
                 f"{len(active)} chunks exceed GitHub's {MAX_MATRIX_JOBS}; raise chunk_rows"
             )
             del active[MAX_MATRIX_JOBS:]
+
+        # Outputs first: a slow digest must never cost the hour's matrix.
+        write_outputs()
+        try:
+            post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs,
+                              run_hours, datetime.now(timezone.utc))
+        except Exception as e:
+            print(f"::warning::daily digest failed ({public_text(e)})", flush=True)
 
         print(f"Active chunks to dispatch: {len(active)}", flush=True)
         if problems:
