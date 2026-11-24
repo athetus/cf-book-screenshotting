@@ -41,6 +41,9 @@ SCOPES = [
 
 VIEWPORT = {"width": 1440, "height": 900}
 NAV_TIMEOUT_MS = 45000
+PAGE_CLOSE_TIMEOUT_S = 15  # closing a stuck page must not stall the chunk
+EVAL_TIMEOUT_S = 60  # page.evaluate on a hung page must not stall the chunk
+ROW_TIMEOUT_S = 240  # whole-row ceiling (two loads, a block retry, screenshot, upload)
 POST_LOAD_WAIT_MS = 2500
 DEFAULT_RUN_HOURS = [9, 19]
 # Rows per matrix job. ~7 s per row, so 120 rows is ~15 minutes, well inside
@@ -433,6 +436,7 @@ def read_control_sheet(sheets_service, control_id):
     ).execute(num_retries=READ_RETRIES)
     jobs_rows = jobs_res.get("values", [])
 
+    problems = []
     jobs = []
     for i, row in enumerate(jobs_rows[1:], start=2):
         row = (row + [""] * 4)[:4]
@@ -445,6 +449,7 @@ def read_control_sheet(sheets_service, control_id):
             stop = datetime.strptime(stop_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
         except Exception as e:
             print(f"  Jobs row {i}: bad date/timezone ({public_text(e)})", file=sys.stderr, flush=True)
+            problems.append(f"control Jobs row {i}: bad date or timezone (row skipped)")
             continue
         jobs.append(
             {
@@ -457,7 +462,8 @@ def read_control_sheet(sheets_service, control_id):
             }
         )
 
-    settings = {"run_hours": list(DEFAULT_RUN_HOURS), "chunk_rows": DEFAULT_CHUNK_ROWS}
+    settings = {"run_hours": list(DEFAULT_RUN_HOURS), "chunk_rows": DEFAULT_CHUNK_ROWS,
+                "problems": problems}
     try:
         s_res = sheets_service.spreadsheets().values().get(
             spreadsheetId=control_id, range="Settings!A:B"
@@ -475,13 +481,16 @@ def read_control_sheet(sheets_service, control_id):
                     if hours:
                         settings["run_hours"] = hours
                     else:
-                        print(f"::error::run_hours '{val}' has no valid hour; using {settings['run_hours']}", flush=True)
+                        print(f"::error::run_hours '{public_text(val)}' has no valid hour; using {settings['run_hours']}", flush=True)
+                        problems.append("control Settings: run_hours has no valid hour (using defaults)")
                 elif key == "chunk_rows":
                     settings["chunk_rows"] = min(MAX_CHUNK_ROWS, max(10, int(val)))
             except ValueError as e:
-                print(f"  bad {key} value '{val}': {public_text(e)}", file=sys.stderr, flush=True)
+                print(f"  bad {key} value '{public_text(val)}': {public_text(e)}", file=sys.stderr, flush=True)
+                problems.append(f"control Settings: bad value for {public_text(key, 40)} (using default)")
     except Exception as e:
         print(f"  could not read Settings tab (using defaults): {public_text(e)}", file=sys.stderr, flush=True)
+        problems.append("control Settings tab unreadable (using defaults)")
 
     return jobs, settings
 
@@ -617,6 +626,7 @@ def cmd_dispatch():
         drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         jobs, settings = read_control_sheet(sheets_service, control_id)
+        problems.extend(settings.get("problems", []))
         run_hours = settings["run_hours"]
         print(f"Run hours: {run_hours}; chunk rows: {settings['chunk_rows']}", flush=True)
         print(f"Jobs in control sheet: {len(jobs)}", flush=True)
@@ -738,13 +748,48 @@ _RANK_BADGE_JS = """
 
 async def extract_rank(page, keyword):
     try:
-        matched_text = await page.get_by_text(keyword, exact=False).first.evaluate(_RANK_BADGE_JS)
+        matched_text = await page.get_by_text(keyword_pattern(keyword)).first.evaluate(_RANK_BADGE_JS)
     except Exception:
         return None
     if not matched_text:
         return None
     digits = re.sub(r"\D", "", matched_text)
     return int(digits) if digits else None
+
+
+_QUOTE_MAP = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'", "\u02bc": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u2033": '"',
+})
+
+
+def normalize_text(text):
+    """Lower-case and turn curly quotes into straight ones, so a keyword typed
+    with one style still matches a page that uses the other."""
+    return (text or "").translate(_QUOTE_MAP).lower()
+
+
+def keyword_in_text(keyword, body_text):
+    return normalize_text(keyword) in normalize_text(body_text)
+
+
+def keyword_pattern(keyword):
+    """Regex for Playwright's get_by_text that treats curly and straight
+    quotes as the same character."""
+    out = []
+    for ch in normalize_text(keyword):
+        if ch == "'":
+            out.append("['\u2018\u2019\u201a\u201b\u2032\u02bc]")
+        elif ch == '"':
+            out.append('["\u201c\u201d\u201e\u201f\u2033]')
+        elif ch.isspace():
+            # Like get_by_text(str): any run of whitespace (line break, nbsp,
+            # double spaces) matches. Adjacent whitespace chars collapse.
+            if not out or out[-1] != r"\s+":
+                out.append(r"\s+")
+        else:
+            out.append(re.escape(ch))
+    return re.compile("".join(out), re.I)
 
 
 def is_blocked_page(body_text):
@@ -787,7 +832,9 @@ class RowError(Exception):
 async def _load(page, url):
     await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     await page.wait_for_timeout(POST_LOAD_WAIT_MS)
-    return await page.evaluate("() => document.body ? document.body.innerText : ''")
+    return await asyncio.wait_for(
+        page.evaluate("() => document.body ? document.body.innerText : ''"), EVAL_TIMEOUT_S
+    )
 
 
 async def process_row(page, row, drive_service, drive_folder_id, filtered_folder_id, sheet_label):
@@ -812,7 +859,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     if is_blocked_page(body_text):
         raise RowError("blocked/throttled by the site")
 
-    if keyword.lower() not in body_text.lower():
+    if not keyword_in_text(keyword, body_text):
         if not looks_like_ranked_list(body_text):
             # Not a normal bestseller list (changed layout, redirect, error
             # page): an error, so it alerts and is retried, instead of a
@@ -827,15 +874,16 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     try:
         # Zoom out before locating the keyword so the element position is
         # computed against the shrunk layout, giving more context around it.
-        await page.evaluate(
-            "(z) => { document.documentElement.style.zoom = z; }", ZOOM_OUT_FACTOR
+        await asyncio.wait_for(
+            page.evaluate("(z) => { document.documentElement.style.zoom = z; }", ZOOM_OUT_FACTOR),
+            EVAL_TIMEOUT_S,
         )
         await page.wait_for_timeout(300)
     except Exception as e:
         print(f"  zoom failed: {public_text(e)}", flush=True)
 
     try:
-        await page.get_by_text(keyword, exact=False).first.scroll_into_view_if_needed(
+        await page.get_by_text(keyword_pattern(keyword)).first.scroll_into_view_if_needed(
             timeout=4000
         )
         await page.wait_for_timeout(400)
@@ -875,13 +923,25 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
     return True
 
 
-def summarize(label, start, end, found, not_found, errors, skipped=0):
+async def process_row_limited(page, *args):
+    """process_row with a whole-row time limit, so one hung page cannot
+    stall the rest of the chunk."""
+    try:
+        return await asyncio.wait_for(process_row(page, *args), ROW_TIMEOUT_S)
+    except asyncio.TimeoutError as e:
+        raise RowError(f"row timed out after {ROW_TIMEOUT_S} s") from e
+
+
+def summarize(label, start, end, found, not_found, errors, skipped=0, not_found_rows=()):
     total = end - start
-    return (
+    text = (
         f"sheet {label} rows {start + 1}-{end}: {found} screenshots, "
         f"{not_found} keyword not found, {skipped} already done this hour, "
         f"{len(errors)} errors (of {total})"
     )
+    if not_found_rows:
+        text += "; not found: " + ", ".join(f"row {n}" for n in list(not_found_rows)[:20])
+    return text
 
 
 def should_fail(found, errors, attempted=None):
@@ -925,6 +985,7 @@ async def cmd_run(matrix_entry):
     skipped = 0
     deferred = 0
     errors = []
+    not_found_rows = []
     started = time.monotonic()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -941,24 +1002,25 @@ async def cmd_run(matrix_entry):
                 skipped += 1
                 continue
             try:
-                if await process_row(page, row, drive_service, drive_folder_id, filtered_folder_id, label):
+                if await process_row_limited(page, row, drive_service, drive_folder_id, filtered_folder_id, label):
                     found += 1
                     done.add(row_suffix(row))
                 else:
                     not_found += 1
+                    not_found_rows.append(i)
             except Exception as e:
                 errors.append(f"row {i}: {e}")
                 print(f"  ERROR row {i}: {public_text(e)}", flush=True)
                 # A fresh page after any failure, so one stuck or crashed
                 # page can't take down the rest of the chunk.
                 try:
-                    await page.close()
+                    await asyncio.wait_for(page.close(), PAGE_CLOSE_TIMEOUT_S)
                 except Exception:
                     pass
                 page = await context.new_page()
         await browser.close()
 
-    summary = summarize(label, start, last, found, not_found, errors, skipped)
+    summary = summarize(label, start, last, found, not_found, errors, skipped, not_found_rows)
     print(f"Done: {summary}", flush=True)
     if deferred:
         summary += f", {deferred} left for the next run"

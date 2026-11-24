@@ -50,6 +50,15 @@ jobs:
       has_jobs: ${{ steps.compute.outputs.has_jobs }}
       problems: ${{ steps.compute.outputs.problems }}
     steps:
+      - name: Heartbeat ping
+        # An external monitor alerts when these pings stop (no run started at
+        # all). Never fails the run; skipped when the secret is not set.
+        env:
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+        run: |
+          if [ -n "$HEARTBEAT_URL" ]; then
+            curl -fsS -m 10 --retry 3 -o /dev/null "$HEARTBEAT_URL" || echo "::warning::heartbeat ping failed"
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -121,7 +130,15 @@ jobs:
     needs: [dispatch, run]
     # Also alert when dispatch hit a problem but other work still ran (a run
     # that is otherwise green).
-    if: failure() || needs.dispatch.outputs.problems == 'true'
+    # always() is needed so the job still evaluates after a cancel or timeout;
+    # a run that was skipped on purpose (no work due) does not alert.
+    if: >-
+      always() && (
+        failure() || cancelled() ||
+        needs.dispatch.result == 'failure' || needs.dispatch.result == 'cancelled' ||
+        needs.run.result == 'failure' || needs.run.result == 'cancelled' ||
+        needs.dispatch.outputs.problems == 'true'
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

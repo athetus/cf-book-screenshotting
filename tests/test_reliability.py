@@ -65,7 +65,7 @@ def test_read_control_sheet_parses_jobs_and_settings():
     jobs, settings = sr.read_control_sheet(sheets, "ctl")
     assert [j["sheet_id"] for j in jobs] == ["ABC_123"]
     assert jobs[0]["tz"] == ZoneInfo("Asia/Kolkata")
-    assert settings == {"run_hours": [1, 3, 0], "chunk_rows": 50}
+    assert (settings["run_hours"], settings["chunk_rows"]) == ([1, 3, 0], 50)
 
 
 def test_read_control_sheet_keeps_defaults_when_run_hours_all_invalid():
@@ -80,7 +80,7 @@ def test_read_control_sheet_keeps_defaults_when_run_hours_all_invalid():
 def test_read_control_sheet_defaults_when_settings_missing():
     sheets = FakeSheets({("ctl", "Jobs!A:D"): [["h"]]})
     _, settings = sr.read_control_sheet(sheets, "ctl")
-    assert settings == {"run_hours": sr.DEFAULT_RUN_HOURS, "chunk_rows": sr.DEFAULT_CHUNK_ROWS}
+    assert (settings["run_hours"], settings["chunk_rows"]) == (sr.DEFAULT_RUN_HOURS, sr.DEFAULT_CHUNK_ROWS)
 
 
 def test_read_data_sheet_skips_header_and_incomplete_rows():
@@ -662,3 +662,161 @@ def test_main_prints_filtered_error_not_traceback(monkeypatch, capsys):
         sr.main()
     out = capsys.readouterr()
     assert "Secret" not in out.out + out.err and "Traceback" not in out.out + out.err
+
+
+# ---------- reliability alerts ----------
+
+def test_control_sheet_bad_job_row_is_reported_as_problem():
+    sheets = FakeSheets({
+        ("ctl", "Jobs!A:D"): [["h"], ["XYZ", "zzcell", "2026-11-03 20:00", "UTC"]],
+    })
+    jobs, settings = sr.read_control_sheet(sheets, "ctl")
+    assert jobs == []
+    assert any("Jobs row 2" in p for p in settings["problems"])
+    assert not any("zzcell" in p or "XYZ" in p for p in settings["problems"])
+
+
+def test_control_sheet_bad_settings_are_reported_as_problems():
+    sheets = FakeSheets({
+        ("ctl", "Jobs!A:D"): [["h"]],
+        ("ctl", "Settings!A:B"): [["k", "v"], ["run_hours", "25,99"], ["chunk_rows", "abc"]],
+    })
+    _, settings = sr.read_control_sheet(sheets, "ctl")
+    assert settings["run_hours"] == sr.DEFAULT_RUN_HOURS
+    assert settings["chunk_rows"] == sr.DEFAULT_CHUNK_ROWS
+    assert len(settings["problems"]) == 2
+
+
+def test_control_sheet_unreadable_settings_tab_is_a_problem():
+    sheets = FakeSheets({("ctl", "Jobs!A:D"): [["h"]]})
+    _, settings = sr.read_control_sheet(sheets, "ctl")
+    assert settings["run_hours"] == sr.DEFAULT_RUN_HOURS
+    assert any("Settings" in p for p in settings["problems"])
+
+
+def test_control_sheet_clean_has_no_problems():
+    sheets = FakeSheets({
+        ("ctl", "Jobs!A:D"): [["h"]],
+        ("ctl", "Settings!A:B"): [["k", "v"], ["run_hours", "1,3"]],
+    })
+    _, settings = sr.read_control_sheet(sheets, "ctl")
+    assert settings["problems"] == []
+
+
+def test_dispatch_sets_problems_for_bad_job_row(monkeypatch, tmp_path):
+    out, _ = _setup_dispatch(monkeypatch, tmp_path, 5)
+    sheets = sr.build("sheets", "v4")
+    sheets.spreadsheets()._values._ranges[("ctl", "Jobs!A:D")].append(["X", "nope", "nope", "UTC"])
+    sr.cmd_dispatch()
+    lines = dict(l.split("=", 1) for l in out.read_text().splitlines())
+    assert lines["problems"] == "true"
+
+
+def test_keyword_match_ignores_curly_vs_straight_quotes():
+    assert sr.keyword_in_text("Bob's Book", "#1 Bob\u2019s Book by Jane")
+    assert sr.keyword_in_text("Bob\u2019s \u201cBook\u201d", "#1 bob's \"book\"")
+    assert not sr.keyword_in_text("Bob's Book", "#1 Other")
+
+
+def test_process_row_finds_keyword_with_curly_apostrophe():
+    row = dict(ROW, keyword="Bob's Book")
+    page = FakePage(["#4 Bob\u2019s Book by Jane"])
+    assert asyncio.run(sr.process_row(page, row, FakeDrive(), "main", "", "L")) is True
+
+
+VALID_PAGE = "#1 Some Book #2 Another Book"
+
+
+def test_process_row_hung_evaluate_is_row_error(monkeypatch):
+    # After the hang the page would look fine, so only the timeout can fail the row.
+    class Hung(FakePage):
+        async def evaluate(self, js, *args):
+            await asyncio.sleep(0.5)
+            return VALID_PAGE
+
+    monkeypatch.setattr(sr, "EVAL_TIMEOUT_S", 0.05)
+    with pytest.raises(sr.RowError, match="load failed"):
+        asyncio.run(sr.process_row(Hung(["x"]), ROW, FakeDrive(), "main", "", "L"))
+
+
+def test_run_row_with_hung_row_times_out_as_row_error(monkeypatch):
+    class Slow(FakePage):
+        async def goto(self, url, **kw):
+            await asyncio.sleep(0.5)
+
+    monkeypatch.setattr(sr, "ROW_TIMEOUT_S", 0.05)
+    with pytest.raises(sr.RowError, match=r"row timed out after 0\.05 s"):
+        asyncio.run(sr.process_row_limited(Slow([VALID_PAGE]), ROW, FakeDrive(), "main", "", "L"))
+
+
+def test_process_row_zoom_hang_times_out_and_row_still_succeeds(monkeypatch, capsys):
+    class ZoomHang(FakePage):
+        async def evaluate(self, js, *args):
+            if "zoom" in js:
+                await asyncio.sleep(30)
+            return await super().evaluate(js, *args)
+
+    async def go():
+        return await asyncio.wait_for(
+            sr.process_row(ZoomHang([VALID_PAGE]), ROW, FakeDrive(), "main", "", "L"), 5
+        )
+
+    monkeypatch.setattr(sr, "EVAL_TIMEOUT_S", 0.05)
+    assert asyncio.run(go()) is True
+    assert "zoom failed" in capsys.readouterr().out
+
+
+def test_run_page_close_hang_does_not_stall_the_chunk(monkeypatch, capsys):
+    class HangClose(_RunPage):
+        async def close(self):
+            await asyncio.sleep(30)
+
+    class Ctx(_FakeContext):
+        async def new_page(self):
+            self.pages += 1
+            return HangClose(self._texts)
+
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "RAISE", "https://a/2": "#1 Some Book"})
+    monkeypatch.setattr(sr, "async_playwright", _fake_playwright(Ctx({"https://a/1": "RAISE", "https://a/2": "#1 Some Book"})))
+    monkeypatch.setattr(sr, "PAGE_CLOSE_TIMEOUT_S", 0.05)
+    asyncio.run(asyncio.wait_for(sr.cmd_run(entry), 5))
+    assert len(_pngs(drive, "main")) == 1
+
+
+def test_run_summary_includes_not_found_rows(monkeypatch, capsys):
+    monkeypatch.setattr(sr, "notify_slack", lambda t: None)
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Some Book", "https://a/2": "#1 Other #2 More"})
+    asyncio.run(sr.cmd_run(entry))
+    assert "not found: row 2" in capsys.readouterr().out
+
+
+def test_keyword_pattern_collapses_whitespace_like_playwright_text_match():
+    pat = sr.keyword_pattern("Some Book  Title")
+    assert pat.search("#1 Some\nBook Title")
+    assert pat.search("#1 Some\u00a0Book\u00a0\u00a0Title")
+    assert pat.search("#1 Some   Book \n Title")
+    assert not pat.search("#1 SomeBook Title")
+    assert not pat.search("#1 Other Book Title")
+
+
+def test_keyword_pattern_keeps_quotes_case_and_escaping():
+    pat = sr.keyword_pattern("Bob's \"Book\" (2)")
+    assert pat.search("bob\u2019s \u201cbook\u201d (2)")
+    assert pat.search("BOB'S \"BOOK\" (2)")
+    assert not pat.search("Bobs Book 2")
+
+
+def test_summary_lists_not_found_rows_without_alerting(monkeypatch):
+    sent = []
+    monkeypatch.setattr(sr, "notify_slack", lambda t: sent.append(t))
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Some Book", "https://a/2": "#1 Other #2 More"})
+    asyncio.run(sr.cmd_run(entry))
+    assert sent == []
+    assert "not found: row 2" in sr.summarize("S", 0, 2, 1, 1, [], not_found_rows=[2])
+
+
+def test_summary_without_not_found_rows_is_unchanged():
+    assert "not found:" not in sr.summarize("S", 0, 2, 2, 0, [])
