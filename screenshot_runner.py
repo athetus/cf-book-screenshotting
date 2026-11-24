@@ -135,7 +135,8 @@ def notify_slack(text):
 
 # ---------- Drive ----------
 
-def find_or_create_subfolder(drive_service, parent_id, name):
+def find_subfolder(drive_service, parent_id, name):
+    """Id of the named folder under parent_id, or None. Never creates one."""
     q = (
         f"name = '{_drive_quote(name)}' "
         f"and mimeType = 'application/vnd.google-apps.folder' "
@@ -147,8 +148,13 @@ def find_or_create_subfolder(drive_service, parent_id, name):
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
     ).execute(num_retries=READ_RETRIES)
-    if res.get("files"):
-        return res["files"][0]["id"]
+    return res["files"][0]["id"] if res.get("files") else None
+
+
+def find_or_create_subfolder(drive_service, parent_id, name):
+    found = find_subfolder(drive_service, parent_id, name)
+    if found:
+        return found
     created = drive_service.files().create(
         body={
             "name": name,
@@ -607,19 +613,23 @@ def write_marker(drive_service, markers_id, name, text):
 DIGEST_TZ = ZoneInfo("Asia/Kolkata")
 DIGEST_HOUR = 9  # first dispatch at or after 09:00 IST posts the digest
 DIGEST_ALERT_AFTER = timedelta(hours=3)
+DIGEST_MAX_SECONDS = 90  # skip the remaining books once the digest has run this long
 
 
 def expected_runs(job, run_hours, now_utc):
-    """How many of the job's run-hours inside its window fell in the last 24 h."""
+    """How many of the job's run-hours inside its window have already finished
+    in the last 24 h. The current local hour is not counted: its screenshots
+    are taken after the dispatch that posts the digest."""
     count = 0
-    for k in range(24):
+    for k in range(1, 24):
         t = local_hour_start(now_utc.astimezone(job["tz"])) - timedelta(hours=k)
         if t.hour in run_hours and job["start"] <= t <= job["stop"] and t > now_utc - timedelta(hours=24):
             count += 1
     return count
 
 
-def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_hours, now_utc):
+def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_hours, now_utc,
+                      max_seconds=DIGEST_MAX_SECONDS, clock=time.monotonic):
     """Post one Slack message per IST day listing, for each book whose window
     is open, the screenshots saved in the last 24 h against what was expected.
     Returns True if a message went out. Raises on Drive/Sheets errors; the
@@ -640,15 +650,31 @@ def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_
     if find_file_by_name(drive_service, markers_id, marker):
         return False
     since = now_utc - timedelta(hours=24)
+    started = clock()
     lines = []
     for job in open_jobs:
-        title = get_sheet_title(sheets_service, job["sheet_id"])
-        n_rows = len(load_rows(sheets_service, job["sheet_id"]))
-        folder_id = find_or_create_subfolder(drive_service, drive_folder_id, title)
-        saved = len(files_since(drive_service, folder_id, since))
+        tag = job["sheet_id"][:8]
+        if clock() - started > max_seconds:
+            lines.append(f"sheet {tag}: skipped (digest time limit)")
+            continue
+        try:
+            title = get_sheet_title(sheets_service, job["sheet_id"])
+        except Exception as e:
+            print(f"::warning::digest: sheet {tag} could not be read ({public_text(e)})", flush=True)
+            lines.append(f"sheet {tag}: could not check")
+            continue
+        try:
+            n_rows = len(load_rows(sheets_service, job["sheet_id"]))
+            # find only: a book never dispatched has no folder yet, and the digest must not create one
+            folder_id = find_subfolder(drive_service, drive_folder_id, title)
+            saved = len(files_since(drive_service, folder_id, since)) if folder_id else 0
+        except Exception as e:
+            print(f"::warning::digest: sheet {tag} could not be checked ({public_text(e)})", flush=True)
+            lines.append(f"{title}: could not check")
+            continue
         expected = expected_runs(job, run_hours, now_utc) * n_rows
         line = f"{title}: {saved} screenshots saved in the last 24 h (expected about {expected})"
-        if saved == 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
+        if saved == 0 and expected > 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
             line = f":warning: {line} - NO screenshots yet"
         lines.append(line)
     if not notify_slack("Daily screenshot digest\n" + "\n".join(lines)):
@@ -665,7 +691,12 @@ def cmd_dispatch():
     active = []
     problems = []
 
+    written = []
+
     def write_outputs():
+        if written:
+            return  # outputs are written once, before the digest; finally must not repeat them
+        written.append(True)
         # Matrix must always have at least one entry, otherwise GitHub Actions
         # errors on strategy expansion. Use a sentinel when there's no work.
         matrix_value = active if active else ["__noop__"]
@@ -772,6 +803,8 @@ def cmd_dispatch():
             )
             del active[MAX_MATRIX_JOBS:]
 
+        # Outputs first: a slow digest must never cost the hour's matrix.
+        write_outputs()
         try:
             post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs,
                               run_hours, datetime.now(timezone.utc))
