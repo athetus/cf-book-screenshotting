@@ -121,7 +121,15 @@ jobs:
     needs: [dispatch, run]
     # Also alert when dispatch hit a problem but other work still ran (a run
     # that is otherwise green).
-    if: failure() || needs.dispatch.outputs.problems == 'true'
+    # always() is needed so the job still evaluates after a cancel or timeout;
+    # a run that was skipped on purpose (no work due) does not alert.
+    if: >-
+      always() && (
+        failure() || cancelled() ||
+        needs.dispatch.result == 'failure' || needs.dispatch.result == 'cancelled' ||
+        needs.run.result == 'failure' || needs.run.result == 'cancelled' ||
+        needs.dispatch.outputs.problems == 'true'
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
