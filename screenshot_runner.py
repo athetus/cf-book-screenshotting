@@ -51,6 +51,15 @@ POST_LOAD_WAIT_MS = 2500
 # fresh context loaded blocked regional pages where the reused one did not).
 BLOCKED_RETRY_ATTEMPTS = 2
 BLOCKED_RETRY_WAIT_S = 30
+# Amazon's soft block page has a "continue shopping" button. Clicking it and
+# reloading the original URL gave the ranked list in 28 of 28 blocked loads
+# (probe 25 Nov 2026, docs/research/2026-11-25-click-through-probe.md).
+CLICK_CYCLES = 2
+POST_CLICK_WAIT_MS = 3000
+CONTINUE_SELECTOR = (
+    'button:has-text("continue shopping"), a:has-text("continue shopping"), '
+    '[role=button]:has-text("continue shopping"), input[value*="continue shopping" i]'
+)
 DEFAULT_RUN_HOURS = [9, 19]
 # Rows per matrix job. ~7 s per row, so 120 rows is ~15 minutes, well inside
 # the job's timeout. Override with Settings!chunk_rows in the control sheet.
@@ -1097,6 +1106,28 @@ async def _load(page, url):
     )
 
 
+async def _click_continue(page):
+    """Click the first visible "continue shopping" element. False if none."""
+    try:
+        btn = page.locator(CONTINUE_SELECTOR).locator("visible=true").first
+        await btn.click(timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
+async def _load_clearing_block(page, url):
+    """Load the URL; if Amazon shows its soft block, click through and reload
+    the original URL (up to CLICK_CYCLES times). Returns the last page text."""
+    body_text = await _load(page, url)
+    for _ in range(CLICK_CYCLES):
+        if not is_blocked_page(body_text) or not await _click_continue(page):
+            break
+        await page.wait_for_timeout(POST_CLICK_WAIT_MS)
+        body_text = await _load(page, url)
+    return body_text
+
+
 async def process_row(page, row, drive_service, drive_folder_id, filtered_folder_id, sheet_label):
     """Returns True if a screenshot was uploaded, False if the keyword was not
     on the page. Raises RowError when the row could not be checked."""
@@ -1108,11 +1139,11 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         raise RowError("not an http(s) URL (check the sheet's URL column)")
 
     try:
-        body_text = await _load(page, url)
+        body_text = await _load_clearing_block(page, url)
         if is_blocked_page(body_text):
             print("  blocked/throttled by the site; retrying once in 20 s", flush=True)
             await page.wait_for_timeout(20000)
-            body_text = await _load(page, url)
+            body_text = await _load_clearing_block(page, url)
     except Exception as e:
         raise RowError(f"load failed: {e}") from e
 
