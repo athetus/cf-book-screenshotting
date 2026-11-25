@@ -370,6 +370,9 @@ class _FakeContext:
         self.pages += 1
         return _RunPage(self._texts)
 
+    async def close(self):
+        self.closed = True
+
 
 class _RunPage(FakePage):
     def __init__(self, texts):
@@ -395,7 +398,7 @@ class _FakeBrowser:
     def __init__(self, ctx):
         self._ctx = ctx
 
-    async def new_context(self, viewport=None):
+    async def new_context(self, **kw):
         return self._ctx
 
     async def close(self):
@@ -896,3 +899,125 @@ def test_first_run_with_only_not_found_rows_still_alerts(monkeypatch):
     drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/2": "#1 Other #2 More"})
     asyncio.run(sr.cmd_run(entry))
     assert len(sent) == 1 and "not found on any page" in sent[0]
+
+
+# ---------- one browser context per locale ----------
+
+@pytest.mark.parametrize("host,expected", [
+    ("www.amazon.ca", "en-CA"),
+    ("amazon.co.uk", "en-GB"),
+    ("www.amazon.com.au", "en-AU"),
+    ("www.amazon.in", "en-IN"),
+    ("www.amazon.sg", "en-SG"),
+    ("www.amazon.com", None),
+    ("www.amazon.de", None),
+    ("www.amazon.fr", None),
+    ("www.amazon.co.jp", None),
+    ("WWW.AMAZON.CA", "en-CA"),
+    ("", None),
+    (None, None),
+    ("example.sin", None),
+    ("example.xco.uk", None),
+])
+def test_locale_for_host(host, expected):
+    assert sr.locale_for_host(host) == expected
+
+
+class _LocaleBrowser:
+    def __init__(self, texts):
+        self.texts = texts
+        self.made = []  # (kwargs, context)
+
+    async def new_context(self, **kw):
+        ctx = _FakeContext(self.texts)
+        ctx.closed = False
+        self.made.append((kw, ctx))
+        return ctx
+
+    async def close(self):
+        pass
+
+
+def _locale_run(monkeypatch, urls, texts):
+    rows = [["Fiction", u, "US", "Some Book"] for u in urls]
+    drive, entry, _ = _setup_run(monkeypatch, rows, texts)
+    browser = _LocaleBrowser(texts)
+
+    class Chromium:
+        async def launch(self, headless=True):
+            return browser
+
+    class P:
+        chromium = Chromium()
+
+    class CM:
+        async def __aenter__(self):
+            return P()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(sr, "async_playwright", lambda: CM())
+    return drive, entry, browser
+
+
+def test_run_uses_one_context_per_locale(monkeypatch):
+    urls = ["https://www.amazon.ca/1", "https://www.amazon.com/2", "https://www.amazon.ca/3", "https://www.amazon.de/4"]
+    drive, entry, browser = _locale_run(monkeypatch, urls, {u: "#1 Some Book" for u in urls})
+    asyncio.run(sr.cmd_run(entry))
+    kws = [kw for kw, _ in browser.made]
+    assert len(kws) == 2  # ca once (rows 1 and 3 share it); com and de share the default
+    ca = [kw for kw in kws if kw.get("locale") == "en-CA"]
+    other = [kw for kw in kws if "locale" not in kw]
+    assert len(ca) == 1 and len(other) == 1
+    for kw in kws:
+        assert kw["viewport"] == sr.VIEWPORT
+        assert kw["extra_http_headers"] == {"Accept-Language": "en-US,en;q=0.9"}
+    assert [c.pages for _, c in browser.made] == [1, 1]
+    assert len(_pngs(drive, "main")) == 4
+
+
+def test_run_different_hosts_get_different_contexts(monkeypatch):
+    urls = ["https://www.amazon.ca/1", "https://www.amazon.co.uk/2", "https://www.amazon.com/3"]
+    drive, entry, browser = _locale_run(monkeypatch, urls, {u: "#1 Some Book" for u in urls})
+    asyncio.run(sr.cmd_run(entry))
+    assert sorted(kw.get("locale", "") for kw, _ in browser.made) == ["", "en-CA", "en-GB"]
+    assert len({id(c) for _, c in browser.made}) == 3
+
+
+def test_run_closes_every_context_even_when_rows_fail(monkeypatch):
+    urls = ["https://www.amazon.ca/1", "https://www.amazon.co.uk/2", "https://www.amazon.co.uk/3", "https://www.amazon.in/4"]
+    texts = {u: "#1 Some Book" for u in urls}
+    texts[urls[1]] = "RAISE"
+    texts[urls[2]] = "RAISE"
+    texts[urls[3]] = "RAISE"
+    drive, entry, browser = _locale_run(monkeypatch, urls, texts)
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(browser.made) == 3
+    assert all(c.closed for _, c in browser.made)
+    # a failed row gets a fresh page in the same context, not a new context
+    assert [c.pages for _, c in browser.made] == [1, 3, 2]
+
+
+def test_run_closes_contexts_when_the_run_itself_crashes(monkeypatch):
+    urls = ["https://www.amazon.ca/1", "https://www.amazon.in/2"]
+    texts = {urls[0]: "#1 Some Book", urls[1]: "RAISE"}
+    drive, entry, browser = _locale_run(monkeypatch, urls, texts)
+    orig = browser.new_context
+
+    async def crashing_context(**kw):
+        ctx = await orig(**kw)
+        if kw.get("locale") == "en-IN":
+            async def boom():
+                if ctx.pages >= 1:
+                    raise RuntimeError("browser died")
+                ctx.pages += 1
+                return _RunPage(texts)
+            ctx.new_page = boom
+        return ctx
+
+    browser.new_context = crashing_context
+    with pytest.raises(RuntimeError):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(browser.made) == 2 and all(c.closed for _, c in browser.made)

@@ -20,6 +20,7 @@ import socket
 import sys
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -933,6 +934,30 @@ class RowError(Exception):
     """A row could not be processed (blocked, load failure, upload failure)."""
 
 
+# English-only locales for regional hosts. Amazon shows a "click the button
+# below to continue shopping" page to a default browser on these hosts; a
+# context whose locale matches the host plus an English Accept-Language header
+# loads the real page. Other hosts keep the browser's default locale.
+HOST_LOCALES = {"ca": "en-CA", "co.uk": "en-GB", "com.au": "en-AU", "in": "en-IN", "sg": "en-SG"}
+ACCEPT_LANGUAGE = {"Accept-Language": "en-US,en;q=0.9"}
+
+
+def locale_for_host(host):
+    """Locale for a mapped English host (e.g. www.<site>.ca -> en-CA), else None."""
+    host = (host or "").lower().rstrip(".")
+    for suffix in sorted(HOST_LOCALES, key=len, reverse=True):
+        if host.endswith("." + suffix):
+            return HOST_LOCALES[suffix]
+    return None
+
+
+def _row_locale(url):
+    try:
+        return locale_for_host(urlsplit(url or "").hostname)
+    except ValueError:
+        return None
+
+
 async def _load(page, url):
     await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     await page.wait_for_timeout(POST_LOAD_WAIT_MS)
@@ -1093,36 +1118,57 @@ async def cmd_run(matrix_entry):
     started = time.monotonic()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport=VIEWPORT)
-        page = await context.new_page()
-        for i, row in enumerate(rows, start=start + 1):
-            if time.monotonic() - started > RUN_BUDGET_S:
-                deferred = last - i + 1
-                print(f"::warning::time budget used; {deferred} rows left for the next run", flush=True)
-                break
-            if row_suffix(row) in done:
-                # Already captured this hour (an earlier run that was cut off,
-                # or a duplicate row in the sheet).
-                skipped += 1
-                continue
-            try:
-                if await process_row_limited(page, row, drive_service, drive_folder_id, filtered_folder_id, label):
-                    found += 1
-                    done.add(row_suffix(row))
-                else:
-                    not_found += 1
-                    not_found_rows.append(i)
-            except Exception as e:
-                errors.append(f"row {i}: {e}")
-                print(f"  ERROR row {i}: {public_text(e)}", flush=True)
-                # A fresh page after any failure, so one stuck or crashed
-                # page can't take down the rest of the chunk.
+        # One context per locale, created on first use and kept for the chunk.
+        contexts = {}  # locale (None = default) -> [context, page]
+
+        async def page_for(locale):
+            if locale not in contexts:
+                kwargs = {"viewport": VIEWPORT, "extra_http_headers": dict(ACCEPT_LANGUAGE)}
+                if locale:
+                    kwargs["locale"] = locale
+                context = await browser.new_context(**kwargs)
+                contexts[locale] = [context, await context.new_page()]
+            return contexts[locale][1]
+
+        try:
+            for i, row in enumerate(rows, start=start + 1):
+                if time.monotonic() - started > RUN_BUDGET_S:
+                    deferred = last - i + 1
+                    print(f"::warning::time budget used; {deferred} rows left for the next run", flush=True)
+                    break
+                if row_suffix(row) in done:
+                    # Already captured this hour (an earlier run that was cut off,
+                    # or a duplicate row in the sheet).
+                    skipped += 1
+                    continue
+                locale = _row_locale(row["url"])
                 try:
-                    await asyncio.wait_for(page.close(), PAGE_CLOSE_TIMEOUT_S)
+                    page = await page_for(locale)
+                    if await process_row_limited(page, row, drive_service, drive_folder_id, filtered_folder_id, label):
+                        found += 1
+                        done.add(row_suffix(row))
+                    else:
+                        not_found += 1
+                        not_found_rows.append(i)
+                except Exception as e:
+                    errors.append(f"row {i}: {e}")
+                    print(f"  ERROR row {i}: {public_text(e)}", flush=True)
+                    # A fresh page after any failure, so one stuck or crashed
+                    # page can't take down the rest of the chunk.
+                    if locale in contexts:
+                        old_page = contexts[locale][1]
+                        try:
+                            await asyncio.wait_for(old_page.close(), PAGE_CLOSE_TIMEOUT_S)
+                        except Exception:
+                            pass
+                        contexts[locale][1] = await contexts[locale][0].new_page()
+        finally:
+            for context, _page in contexts.values():
+                try:
+                    await asyncio.wait_for(context.close(), PAGE_CLOSE_TIMEOUT_S)
                 except Exception:
                     pass
-                page = await context.new_page()
-        await browser.close()
+            await browser.close()
 
     summary = summarize(label, start, last, found, not_found, errors, skipped, not_found_rows)
     print(f"Done: {summary}", flush=True)
