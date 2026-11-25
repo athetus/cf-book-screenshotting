@@ -1202,15 +1202,22 @@ async def cmd_run(matrix_entry):
                     print(f"  row {i} blocked; retrying in a fresh context in {BLOCKED_RETRY_WAIT_S} s", flush=True)
                     await asyncio.sleep(BLOCKED_RETRY_WAIT_S)
                     fresh = None
+                    setup_done = False
                     try:
                         fresh = await browser.new_context(**context_kwargs(locale))
                         fresh_page = await fresh.new_page()
+                        setup_done = True
                         result = await process_row_limited(
                             fresh_page, row, drive_service, drive_folder_id, filtered_folder_id, label)
                         break
                     except Exception as e:
                         last_error = e
                         print(f"  ERROR row {i} (fresh context): {public_text(e)}", flush=True)
+                        # Only blocked rows are retried: a load or upload error
+                        # ends the retries (a landed upload must not be redone).
+                        # A context that could not be set up may try again.
+                        if setup_done and not isinstance(e, BlockedError):
+                            break
                     finally:
                         if fresh is not None:
                             try:

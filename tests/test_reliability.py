@@ -1184,6 +1184,62 @@ def test_fresh_context_closed_even_when_attempt_raises(monkeypatch):
     assert len(_pngs(drive, "main")) == 1
 
 
+def _scripted_rows(monkeypatch, outcomes):
+    """process_row_limited raises/returns the next scripted outcome on each call."""
+    calls = []
+
+    async def scripted(page, *a):
+        calls.append(page)
+        out = outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    monkeypatch.setattr(sr, "process_row_limited", scripted)
+    return calls
+
+
+def test_non_blocked_load_error_in_fresh_context_is_not_retried(monkeypatch, capsys):
+    drive, entry, hkey, browser = _setup_blocked(monkeypatch, CA_URL, [{CA_URL: BLOCKED}])
+    calls = _scripted_rows(monkeypatch, [sr.BlockedError("blocked"), RuntimeError("load failed"), True])
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(browser.contexts) == 2  # cached one + a single fresh attempt
+    assert len(calls) == 2
+    assert all(c.closed for c in browser.contexts[1:])
+    out = capsys.readouterr().out
+    assert "\n  - row 1: load failed\n" in out
+    assert "recovered" not in out
+
+
+def test_upload_error_in_fresh_context_is_not_retried(monkeypatch, capsys):
+    drive, entry, hkey, browser = _setup_blocked(monkeypatch, CA_URL, [{CA_URL: BLOCKED}])
+    calls = _scripted_rows(monkeypatch, [sr.BlockedError("blocked"), OSError("upload failed"), True])
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(calls) == 2  # no second fresh attempt, so no duplicate upload
+    assert len(browser.contexts) == 2
+    assert "\n  - row 1: upload failed\n" in capsys.readouterr().out
+
+
+def test_context_creation_failure_moves_to_next_fresh_attempt(monkeypatch):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: BLOCKED}, {CA_URL: "#2 Some Book"}])
+    real_new_context = browser.new_context
+    state = {"n": 0}
+
+    async def flaky(**kw):
+        state["n"] += 1
+        if state["n"] == 2:  # first fresh context cannot be created
+            raise RuntimeError("no context")
+        return await real_new_context(**kw)
+
+    browser.new_context = flaky
+    asyncio.run(sr.cmd_run(entry))
+    assert state["n"] == 3
+    assert len(_pngs(drive, "main")) == 1
+
+
 def test_blocked_retry_wait_uses_constant(monkeypatch):
     drive, entry, hkey, browser = _setup_blocked(
         monkeypatch, CA_URL, [{CA_URL: BLOCKED}, {CA_URL: "#2 Some Book"}])
