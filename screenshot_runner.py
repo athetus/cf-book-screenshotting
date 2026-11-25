@@ -1132,12 +1132,22 @@ async def cmd_run(matrix_entry):
                      f"the next run this hour continues if the hour is in run_hours).")
     for err in errors[:20]:
         print(f"  - {public_text(err)}", flush=True)
+    # Rows already saved this hour count as successes: on a retry they are
+    # "skipped", not "found".
+    worked = found + skipped
+    is_retry = skipped > 0
     if errors:
-        notify_slack(f":warning: Screenshots for {title}: {summary}. First error: {errors[0][:200]}")
-    elif found == 0 and not_found > 0:
+        if not is_retry:
+            notify_slack(f":warning: Screenshots for {title}: {summary}. First error: {errors[0][:200]}")
+        elif found > 0:
+            notify_slack(f":warning: Screenshots for {title}: {summary}. On this retry recovered {found}, "
+                         f"{len(errors)} still fail. First error: {errors[0][:200]}")
+        # Retry that recovered nothing: the earlier run already alerted; the
+        # summary and ::warning:: below are enough.
+    elif worked == 0 and not_found > 0:
         notify_slack(f":warning: Screenshots for {title}: {summary}. The book was not found on any page "
                      f"in this chunk; check the sheet's keywords or Amazon's pages.")
-    if should_fail(found, errors, found + not_found + len(errors)):
+    if should_fail(worked, errors, worked + not_found + len(errors)):
         print("::error::" + summary, flush=True)
         sys.exit(1)
     if errors or deferred:
