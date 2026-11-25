@@ -715,7 +715,7 @@ def test_dispatch_sets_problems_for_bad_job_row(monkeypatch, tmp_path):
 def test_keyword_match_ignores_curly_vs_straight_quotes():
     assert sr.keyword_in_text("Bob's Book", "#1 Bob\u2019s Book by Jane")
     assert sr.keyword_in_text("Bob\u2019s \u201cBook\u201d", "#1 bob's \"book\"")
-    assert not sr.keyword_in_text("Bob's Book", "#1 Other")
+    assert not sr.keyword_in_text("Bob's Book", "#1 Other #2 More")
 
 
 def test_process_row_finds_keyword_with_curly_apostrophe():
@@ -820,3 +820,79 @@ def test_summary_lists_not_found_rows_without_alerting(monkeypatch):
 
 def test_summary_without_not_found_rows_is_unchanged():
     assert "not found:" not in sr.summarize("S", 0, 2, 2, 0, [])
+
+
+# ---------- retry runs: rows already done this hour count as successes ----------
+
+def _row(i, cat="Fiction"):
+    return {"category": cat, "country": "US", "keyword": "Some Book", "url": f"https://a/{i}"}
+
+
+def _mark_done(drive, *idx):
+    for i in idx:
+        drive.files().add("20261102-153500_" + sr.row_suffix(_row(i)), "main")
+
+
+def test_should_fail_counts_already_done_rows_as_successes():
+    # retry: 7 rows already done, one blocked row
+    assert not sr.should_fail(0 + 7, ["row 8: x"], 7 + 0 + 1)
+    # first run, nothing worked: still fails
+    assert sr.should_fail(0, ["row 1: x"], 1)
+    # retry where most remaining rows still error: still fails
+    assert sr.should_fail(1, ["e"] * 20, 21)
+
+
+def test_retry_with_one_blocked_row_does_not_fail_or_alert(monkeypatch, capsys):
+    sent = []
+    monkeypatch.setattr(sr, "notify_slack", lambda t: sent.append(t))
+    rows = [["Fiction", f"https://a/{i}", "US", "Some Book"] for i in range(8)]
+    texts = {f"https://a/{i}": "#1 Some Book" for i in range(8)}
+    texts["https://a/7"] = "RAISE"
+    drive, entry, hkey = _setup_run(monkeypatch, rows, texts)
+    _mark_done(drive, 0, 1, 2, 3, 4, 5, 6)
+    asyncio.run(sr.cmd_run(entry))  # must not raise SystemExit
+    assert sent == []
+    assert "::warning::" in capsys.readouterr().out
+    assert not sr.chunk_done(drive, "mk", "S", hkey, 0, 8)
+
+
+def test_first_run_with_all_rows_erroring_fails_and_alerts(monkeypatch):
+    sent = []
+    monkeypatch.setattr(sr, "notify_slack", lambda t: sent.append(t))
+    rows = [["Fiction", "https://a/1", "US", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "RAISE"})
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(sent) == 1 and "First error" in sent[0] and "recovered" not in sent[0]
+
+
+def test_retry_that_recovers_some_rows_alerts_with_recovered_count(monkeypatch):
+    sent = []
+    monkeypatch.setattr(sr, "notify_slack", lambda t: sent.append(t))
+    rows = [["Fiction", f"https://a/{i}", "US", "Some Book"] for i in range(5)]
+    texts = {f"https://a/{i}": "#1 Some Book" for i in range(5)}
+    texts["https://a/4"] = "RAISE"
+    drive, entry, _ = _setup_run(monkeypatch, rows, texts)
+    _mark_done(drive, 0, 1)
+    asyncio.run(sr.cmd_run(entry))
+    assert len(sent) == 1
+    assert "recovered 2" in sent[0] and "1 still fail" in sent[0] and "First error" in sent[0]
+
+
+def test_retry_not_found_alert_not_sent_when_rows_already_done(monkeypatch):
+    sent = []
+    monkeypatch.setattr(sr, "notify_slack", lambda t: sent.append(t))
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Some Book", "https://a/2": "#1 Other #2 More"})
+    _mark_done(drive, 1)
+    asyncio.run(sr.cmd_run(entry))
+    assert sent == []
+
+
+def test_first_run_with_only_not_found_rows_still_alerts(monkeypatch):
+    sent = []
+    monkeypatch.setattr(sr, "notify_slack", lambda t: sent.append(t))
+    rows = [["Drama", "https://a/2", "UK", "Some Book"]]
+    drive, entry, _ = _setup_run(monkeypatch, rows, {"https://a/2": "#1 Other #2 More"})
+    asyncio.run(sr.cmd_run(entry))
+    assert len(sent) == 1 and "not found on any page" in sent[0]
