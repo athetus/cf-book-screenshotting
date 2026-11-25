@@ -1368,3 +1368,33 @@ def test_result_write_failure_does_not_turn_a_failing_run_into_another_error(mon
     with pytest.raises(SystemExit) as e:
         asyncio.run(sr.cmd_run(entry))
     assert e.value.code == 1
+
+
+def test_result_file_blocked_list_is_the_final_one_after_the_fresh_context_pass(monkeypatch):
+    """Row 1 is blocked in the main loop but recovered in a fresh context: it
+    is found, not blocked. Row 2 stays blocked: it is the only blocked row."""
+    monkeypatch.setattr(sr, "notify_slack", lambda t: None)
+    rows = [["Fiction", "https://a/1", "US", "Some Book"], ["Fiction", "https://a/2", "US", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {})
+    ok = {"https://a/1": "#1 Some Book", "https://a/2": BLOCKED}
+    browser = _SeqBrowser([{"https://a/1": BLOCKED, "https://a/2": BLOCKED}, ok])
+
+    class Chromium:
+        async def launch(self, headless=True):
+            return browser
+
+    class P:
+        chromium = Chromium()
+
+    class CM:
+        async def __aenter__(self):
+            return P()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(sr, "async_playwright", lambda: CM())
+    monkeypatch.setattr(sr, "BLOCKED_RETRY_WAIT_S", 0)
+    asyncio.run(sr.cmd_run(entry))
+    assert [d for _, d in _results(drive)] == [
+        {"found": [1], "not_found": [], "blocked": [2], "error": [], "skipped": []}]

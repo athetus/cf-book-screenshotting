@@ -450,3 +450,91 @@ def test_digest_row_skipped_because_already_captured_counts_as_read(slack):
     text = digest_text(slack)
     assert "page never read" not in text and ":warning:" not in text
     assert "Blocked at least once: row 9 (1 of 2 runs)." in text
+
+
+# ---------- fake Drive honours `fields`; paging; empty sheet; rows with no result ----------
+
+def test_fake_drive_returns_only_requested_keys():
+    drive, _, _, markers = make_world()
+    add_result(drive, markers, 0, {"found": [1]})
+    res = drive.files().list(q=f"'{markers}' in parents", fields="nextPageToken, files(name)").execute()
+    assert res["files"] and all(set(f) == {"name"} for f in res["files"])
+
+
+def test_digest_list_call_must_request_description(slack):
+    """Guards the live digest: without `description` in fields the real API
+    returns no row lists and the digest would silently show nothing."""
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 2, 3]})
+    run(drive, sheets, [make_job()])
+    assert "over 1 runs." in digest_text(slack)
+    result_lists = [kw for name, kw in drive.files().calls
+                    if name == "list" and "result_" not in kw["q"] and kw["q"].startswith(f"'{markers}'")
+                    and "createdTime" in kw["q"]]
+    assert result_lists and all("description" in kw["fields"] for kw in result_lists)
+
+
+def test_results_since_reads_every_page():
+    drive, _, _, markers = make_world()
+    drive.files().page_size_cap = 2
+    for h in range(5):
+        add_result(drive, markers, h, {"found": [h + 1]})
+    got = sr.results_since(drive, markers, SHEET, NOW - timedelta(hours=24))
+    assert len(got) == 5
+    lists = [kw for name, kw in drive.files().calls if name == "list"]
+    assert len(lists) == 3  # 2 + 2 + 1 results
+
+
+def test_digest_counts_runs_across_pages(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    drive.files().page_size_cap = 2
+    add_shots(drive, book, 1, age_h=2)
+    for h in range(5):
+        add_result(drive, markers, h, {"found": [1, 2, 3]})
+    run(drive, sheets, [make_job()])
+    assert "over 5 runs." in digest_text(slack)
+
+
+def test_empty_sheet_gets_no_never_screenshotted_warning(slack):
+    drive, sheets, _, _ = make_world(n_rows=0)
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "Fake Book: 0 screenshots saved" in text
+    assert "NO screenshots yet" not in text and ":warning:" not in text
+
+
+def test_rows_with_no_result_anywhere_are_named(slack):
+    drive, sheets, book, markers = make_world(n_rows=5)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 2]})
+    add_result(drive, markers, 1, {"found": [1], "error": [2]})
+    run(drive, sheets, [make_job()])
+    lines = digest_text(slack).split("\n")
+    assert "No result recorded for rows 3-5." in lines
+    assert len([ln for ln in lines if "No result recorded" in ln]) == 1
+    assert ":warning:" not in "\n".join(ln for ln in lines if "No result recorded" in ln)
+
+
+def test_row_with_no_result_is_named_alone(slack):
+    drive, sheets, book, markers = make_world(n_rows=4)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 3], "not_found": [4]})
+    run(drive, sheets, [make_job()])
+    assert "No result recorded for row 2." in digest_text(slack).split("\n")
+
+
+def test_healthy_day_prints_no_missing_result_line(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 3, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 2], "blocked": [3]})
+    add_result(drive, markers, 1, {"found": [1, 2], "skipped": [3]})
+    run(drive, sheets, [make_job()])
+    assert "No result recorded" not in digest_text(slack)
+
+
+def test_no_missing_result_line_without_any_runs(slack):
+    drive, sheets, book, _ = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    run(drive, sheets, [make_job()])
+    assert "No result recorded" not in digest_text(slack)

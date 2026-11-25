@@ -682,9 +682,21 @@ def _row_list(rows):
     return ", ".join(str(n) for n in rows)
 
 
-def row_digest_lines(title, results):
+def _row_ranges(rows):
+    """[3, 4, 5, 8] -> '3-5, 8'."""
+    out = []
+    for n in sorted(rows):
+        if out and n == out[-1][1] + 1:
+            out[-1][1] = n
+        else:
+            out.append([n, n])
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in out)
+
+
+def row_digest_lines(title, results, n_rows=0):
     """Digest text for one book from its result files: (text appended to the
-    count line, list of separate warning lines)."""
+    count line, list of separate lines: warnings, then a plain note for rows
+    of the sheet that no run recorded any result for)."""
     hours = {h for h, _ in results}
     runs = len(hours)
     per_row = {}  # row -> {outcome: set of hours}
@@ -710,6 +722,9 @@ def row_digest_lines(title, results):
         all_blocked = all(len(per_row[n]["blocked"]) == runs for n in never_read)
         how = f"blocked in all {runs} runs" if all_blocked else f"blocked, never read in {runs} runs"
         warnings.append(f":warning: {title}: page never read ({how}): rows {_row_list(never_read)}")
+    no_result = [n for n in range(1, n_rows + 1) if n not in per_row]
+    if no_result:
+        warnings.append(f"No result recorded for row{'s' if len(no_result) > 1 else ''} {_row_ranges(no_result)}.")
     return text, warnings
 
 
@@ -765,6 +780,7 @@ def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_
             continue
         try:
             title = get_sheet_title(sheets_service, job["sheet_id"])
+            n_rows = len(load_rows(sheets_service, job["sheet_id"]))
         except Exception as e:
             print(f"::warning::digest: sheet {tag} could not be read ({public_text(e)})", flush=True)
             lines.append(f"sheet {tag}: could not check")
@@ -781,11 +797,11 @@ def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_
         try:
             results = results_since(drive_service, markers_id, job["sheet_id"], since)
             if results:
-                detail, warnings = row_digest_lines(title, results)
+                detail, warnings = row_digest_lines(title, results, n_rows)
         except Exception as e:
             print(f"::warning::digest: sheet {tag} row results could not be read ({public_text(e)})", flush=True)
         line = f"{title}: {saved} screenshots saved in the last 24 h" + (detail or "")
-        if saved == 0 and expected_runs(job, run_hours, now_utc) > 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
+        if n_rows > 0 and saved == 0 and expected_runs(job, run_hours, now_utc) > 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
             line = f":warning: {line} - NO screenshots yet"
         lines.append(line)
         lines.extend(warnings)
