@@ -12,6 +12,15 @@ class FakeExec:
         return self._fn()
 
 
+def _requested_keys(fields):
+    """Keys named inside files(...) of a Drive `fields` argument, like the real
+    API. No fields given: the API default (id, name, mimeType)."""
+    m = re.search(r"files\(([^)]*)\)", fields or "")
+    if not m:
+        return ["id", "name", "mimeType"]
+    return [k.strip() for k in m.group(1).split(",") if k.strip()]
+
+
 class FakeDriveFiles:
     """Keeps files in a dict; supports the queries screenshot_runner builds."""
 
@@ -23,7 +32,7 @@ class FakeDriveFiles:
         self.create_lands_then_fails = False
         self.page_size_cap = None
 
-    def add(self, name, parent, mime="image/png", created=None):
+    def add(self, name, parent, mime="image/png", created=None, description=None):
         fid = f"f{self._next}"
         self._next += 1
         self.files[fid] = {
@@ -31,6 +40,7 @@ class FakeDriveFiles:
             "parents": [parent],
             "mimeType": mime,
             "createdTime": created or datetime.now(timezone.utc),
+            "description": description,
         }
         return fid
 
@@ -55,14 +65,19 @@ class FakeDriveFiles:
         self.calls.append(("list", kw))
 
         def run():
-            hits = [{"id": i, "name": f["name"]} for i, f in self.files.items() if self._match(kw["q"], f)]
+            wanted = _requested_keys(kw.get("fields"))
+            hits = []
+            for i, f in self.files.items():
+                if self._match(kw["q"], f):
+                    full = dict(f, id=i)
+                    hits.append({k: full[k] for k in wanted if k in full})
             size = kw.get("pageSize", 100)
             if self.page_size_cap:
                 size = min(size, self.page_size_cap)
             start = int(kw.get("pageToken") or 0)
             page = hits[start:start + size]
             res = {"files": page}
-            if start + size < len(hits):
+            if start + size < len(hits) and "nextPageToken" in (kw.get("fields") or ""):
                 res["nextPageToken"] = str(start + size)
             return res
 
@@ -75,9 +90,9 @@ class FakeDriveFiles:
             if self.create_failures:
                 exc = self.create_failures.pop(0)
                 if self.create_lands_then_fails:
-                    self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"))
+                    self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"), description=body.get("description"))
                 raise exc
-            fid = self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"))
+            fid = self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"), description=body.get("description"))
             return {"id": fid}
 
         return FakeExec(run)

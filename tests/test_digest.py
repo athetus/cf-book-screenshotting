@@ -58,14 +58,14 @@ def run(drive, sheets, jobs, now=NOW, run_hours=(9, 19)):
     return sr.post_daily_digest(drive, sheets, FOLDER, jobs, list(run_hours), now)
 
 
-def test_digest_reports_count_and_expected_per_book(slack):
+def test_digest_reports_count_per_book(slack):
     drive, sheets, book, _ = make_world(n_rows=3)
     add_shots(drive, book, 4, age_h=2)    # inside 24 h; same names may repeat
     add_shots(drive, book, 3, age_h=26)   # older: not counted
     assert run(drive, sheets, [make_job()]) is True
     assert len(slack) == 1
-    # only the 19:00 run yesterday is finished; the 09:00 run of the current hour has not happened yet
-    assert "Fake Book: 4 screenshots saved in the last 24 h (expected about 3)" in slack[0]
+    assert "Fake Book: 4 screenshots saved in the last 24 h" in slack[0]
+    assert "expected" not in slack[0]
     assert "NO screenshots" not in slack[0]
 
 
@@ -142,14 +142,13 @@ def test_expected_count_ignores_run_hours_outside_window(slack):
     drive, sheets, _, _ = make_world(n_rows=3)
     # window opened at 09:15 IST today: the 09:00 run did not belong to it, nor did yesterday's
     run(drive, sheets, [make_job(start="2026-11-25 09:15")])
-    assert "expected about 0)" in slack[0]
+    assert "NO screenshots" not in slack[0] and ":warning:" not in slack[0]  # no finished run belonged to the window
 
 
 def test_current_hour_run_is_not_expected_and_zero_saved_warns(slack):
     drive, sheets, _, _ = make_world(n_rows=3)
     now = datetime(2026, 11, 25, 4, 5, tzinfo=UTC)  # 09:35 IST
     run(drive, sheets, [make_job(start="2026-11-23 20:00")], now=now)
-    assert "expected about 3)" in slack[0]  # only yesterday's 19:00 run
     assert "NO screenshots yet" in slack[0]
 
 
@@ -157,7 +156,7 @@ def test_healthy_new_book_with_no_finished_run_hour_is_not_flagged(slack):
     drive, sheets, _, _ = make_world(n_rows=3)
     now = datetime(2026, 11, 25, 4, 5, tzinfo=UTC)  # 09:35 IST
     run(drive, sheets, [make_job(start="2026-11-25 05:00")], now=now, run_hours=(10, 16, 22))
-    assert "0 screenshots saved in the last 24 h (expected about 0)" in slack[0]
+    assert "0 screenshots saved in the last 24 h" in slack[0] and "expected" not in slack[0]
     assert "NO screenshots" not in slack[0] and ":warning:" not in slack[0]
 
 
@@ -304,3 +303,238 @@ def test_dispatch_survives_a_digest_failure_and_keeps_the_matrix(monkeypatch, tm
     text = out.read_text()
     assert "has_jobs=true" in text and SHEET in text
     assert "::warning::" in capsys.readouterr().out
+
+
+# ---------- per-row results in the digest ----------
+
+import json
+
+
+def add_result(drive, markers, hour, rows, sheet=SHEET, age_h=2, start=0, end=20, raw=None):
+    """One result file per run. rows maps outcome name -> row numbers."""
+    data = {k: [] for k in ("found", "not_found", "blocked", "error", "skipped")}
+    data.update(rows)
+    drive.files().add(f"result_{sheet}_20261125T{hour:04d}Z_{start}-{end}_1700000000", markers,
+                      "text/plain", created=NOW - timedelta(hours=age_h),
+                      description=raw if raw is not None else json.dumps(data))
+
+
+def digest_text(slack):
+    assert len(slack) == 1
+    return slack[0]
+
+
+def test_digest_all_rows_healthy(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 3, age_h=2)
+    for h in range(11):
+        add_result(drive, markers, h, {"found": [1, 2, 3]})
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "Fake Book: 3 screenshots saved in the last 24 h over 11 runs." in text
+    assert "Not in the list" not in text and "Blocked" not in text and ":warning:" not in text
+
+
+def test_digest_rows_not_in_the_list(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    for h in range(11):
+        add_result(drive, markers, h, {"found": [1, 2], "not_found": [8, 9]})
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "over 11 runs. Not in the list (all runs): rows 8, 9." in text
+    assert ":warning:" not in text
+
+
+def test_digest_row_blocked_some_runs_but_found_once(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    for h in range(11):
+        if h < 4:
+            add_result(drive, markers, h, {"found": [1], "blocked": [9]})
+        elif h == 4:
+            add_result(drive, markers, h, {"found": [1, 9]})
+        else:
+            add_result(drive, markers, h, {"found": [1], "error": [9]})
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "Blocked at least once: row 9 (4 of 11 runs)." in text
+    assert "page never read" not in text and ":warning:" not in text
+    assert "Not in the list" not in text
+
+
+def test_digest_row_blocked_in_every_run_and_never_read_warns(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    for h in range(11):
+        add_result(drive, markers, h, {"found": [1], "blocked": [9]})
+    run(drive, sheets, [make_job()])
+    lines = digest_text(slack).split("\n")
+    warn = [ln for ln in lines if ln.startswith(":warning:")]
+    assert warn == [":warning: Fake Book: page never read (blocked in all 11 runs): rows 9"]
+
+
+def test_digest_blocked_and_not_in_list_is_not_a_never_read_warning(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"not_found": [8], "blocked": [8]})
+    add_result(drive, markers, 1, {"not_found": [8]})
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "page never read" not in text
+    assert "Not in the list" in text and "Blocked at least once: row 8 (1 of 2 runs)." in text
+
+
+def test_digest_ignores_malformed_result_files(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 2, age_h=2)
+    add_result(drive, markers, 0, {"found": [1]})
+    add_result(drive, markers, 1, {}, raw="not json")
+    add_result(drive, markers, 2, {}, raw='{"found": "x"}')
+    add_result(drive, markers, 3, {}, raw="[1, 2]")
+    add_result(drive, markers, 4, {}, raw=None, sheet="OTHER")
+    run(drive, sheets, [make_job()])
+    assert "Fake Book: 2 screenshots saved in the last 24 h over 1 runs." in digest_text(slack)
+
+
+def test_digest_ignores_result_files_older_than_24_hours(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"blocked": [9]}, age_h=30)
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "over" not in text and "Fake Book: 1 screenshots saved in the last 24 h" in text
+
+
+def test_digest_without_result_files_falls_back_and_never_says_expected(slack):
+    drive, sheets, book, _ = make_world(n_rows=3)
+    add_shots(drive, book, 4, age_h=2)
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "Fake Book: 4 screenshots saved in the last 24 h" in text
+    assert "expected" not in text.lower() and "over" not in text
+
+
+def test_digest_no_expected_wording_in_any_case(slack):
+    drive, sheets, _, markers = make_world(n_rows=3)
+    add_result(drive, markers, 0, {"found": [1]})
+    run(drive, sheets, [make_job()])
+    assert "expected" not in digest_text(slack).lower()
+
+
+def test_digest_zero_screenshots_rule_kept_with_result_files(slack):
+    drive, sheets, _, markers = make_world(n_rows=3)
+    add_result(drive, markers, 0, {"blocked": [1, 2, 3]})
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "NO screenshots yet" in text
+    assert "Fake Book: 0 screenshots saved" in text
+
+
+def test_digest_result_read_failure_keeps_the_count(slack, monkeypatch, capsys):
+    drive, sheets, book, _ = make_world(n_rows=3)
+    add_shots(drive, book, 2, age_h=2)
+    monkeypatch.setattr(sr, "results_since",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("drive hiccup")))
+    run(drive, sheets, [make_job()])
+    assert "Fake Book: 2 screenshots saved in the last 24 h" in digest_text(slack)
+    assert "::warning::" in capsys.readouterr().out
+
+
+def test_digest_row_skipped_because_already_captured_counts_as_read(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"blocked": [9]})
+    add_result(drive, markers, 1, {"skipped": [9]})
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "page never read" not in text and ":warning:" not in text
+    assert "Blocked at least once: row 9 (1 of 2 runs)." in text
+
+
+# ---------- fake Drive honours `fields`; paging; empty sheet; rows with no result ----------
+
+def test_fake_drive_returns_only_requested_keys():
+    drive, _, _, markers = make_world()
+    add_result(drive, markers, 0, {"found": [1]})
+    res = drive.files().list(q=f"'{markers}' in parents", fields="nextPageToken, files(name)").execute()
+    assert res["files"] and all(set(f) == {"name"} for f in res["files"])
+
+
+def test_digest_list_call_must_request_description(slack):
+    """Guards the live digest: without `description` in fields the real API
+    returns no row lists and the digest would silently show nothing."""
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 2, 3]})
+    run(drive, sheets, [make_job()])
+    assert "over 1 runs." in digest_text(slack)
+    result_lists = [kw for name, kw in drive.files().calls
+                    if name == "list" and "result_" not in kw["q"] and kw["q"].startswith(f"'{markers}'")
+                    and "createdTime" in kw["q"]]
+    assert result_lists and all("description" in kw["fields"] for kw in result_lists)
+
+
+def test_results_since_reads_every_page():
+    drive, _, _, markers = make_world()
+    drive.files().page_size_cap = 2
+    for h in range(5):
+        add_result(drive, markers, h, {"found": [h + 1]})
+    got = sr.results_since(drive, markers, SHEET, NOW - timedelta(hours=24))
+    assert len(got) == 5
+    lists = [kw for name, kw in drive.files().calls if name == "list"]
+    assert len(lists) == 3  # 2 + 2 + 1 results
+
+
+def test_digest_counts_runs_across_pages(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    drive.files().page_size_cap = 2
+    add_shots(drive, book, 1, age_h=2)
+    for h in range(5):
+        add_result(drive, markers, h, {"found": [1, 2, 3]})
+    run(drive, sheets, [make_job()])
+    assert "over 5 runs." in digest_text(slack)
+
+
+def test_empty_sheet_gets_no_never_screenshotted_warning(slack):
+    drive, sheets, _, _ = make_world(n_rows=0)
+    run(drive, sheets, [make_job()])
+    text = digest_text(slack)
+    assert "Fake Book: 0 screenshots saved" in text
+    assert "NO screenshots yet" not in text and ":warning:" not in text
+
+
+def test_rows_with_no_result_anywhere_are_named(slack):
+    drive, sheets, book, markers = make_world(n_rows=5)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 2]})
+    add_result(drive, markers, 1, {"found": [1], "error": [2]})
+    run(drive, sheets, [make_job()])
+    lines = digest_text(slack).split("\n")
+    assert "No result recorded for rows 3-5." in lines
+    assert len([ln for ln in lines if "No result recorded" in ln]) == 1
+    assert ":warning:" not in "\n".join(ln for ln in lines if "No result recorded" in ln)
+
+
+def test_row_with_no_result_is_named_alone(slack):
+    drive, sheets, book, markers = make_world(n_rows=4)
+    add_shots(drive, book, 1, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 3], "not_found": [4]})
+    run(drive, sheets, [make_job()])
+    assert "No result recorded for row 2." in digest_text(slack).split("\n")
+
+
+def test_healthy_day_prints_no_missing_result_line(slack):
+    drive, sheets, book, markers = make_world(n_rows=3)
+    add_shots(drive, book, 3, age_h=2)
+    add_result(drive, markers, 0, {"found": [1, 2], "blocked": [3]})
+    add_result(drive, markers, 1, {"found": [1, 2], "skipped": [3]})
+    run(drive, sheets, [make_job()])
+    assert "No result recorded" not in digest_text(slack)
+
+
+def test_no_missing_result_line_without_any_runs(slack):
+    drive, sheets, book, _ = make_world(n_rows=3)
+    add_shots(drive, book, 1, age_h=2)
+    run(drive, sheets, [make_job()])
+    assert "No result recorded" not in digest_text(slack)
