@@ -937,7 +937,7 @@ class RowError(Exception):
 # English-only locales for regional hosts. Amazon shows a "click the button
 # below to continue shopping" page to a default browser on these hosts; a
 # context whose locale matches the host plus an English Accept-Language header
-# loads the real page. Other hosts keep the browser's default locale.
+# loads the real page. Other hosts get a plain viewport-only context.
 HOST_LOCALES = {"ca": "en-CA", "co.uk": "en-GB", "com.au": "en-AU", "in": "en-IN", "sg": "en-SG"}
 ACCEPT_LANGUAGE = {"Accept-Language": "en-US,en;q=0.9"}
 
@@ -1123,11 +1123,21 @@ async def cmd_run(matrix_entry):
 
         async def page_for(locale):
             if locale not in contexts:
-                kwargs = {"viewport": VIEWPORT, "extra_http_headers": dict(ACCEPT_LANGUAGE)}
+                kwargs = {"viewport": VIEWPORT}
                 if locale:
+                    # Only mapped English hosts change; other hosts stay exactly as before.
                     kwargs["locale"] = locale
+                    kwargs["extra_http_headers"] = dict(ACCEPT_LANGUAGE)
                 context = await browser.new_context(**kwargs)
-                contexts[locale] = [context, await context.new_page()]
+                try:
+                    page = await context.new_page()
+                except BaseException:
+                    try:
+                        await asyncio.wait_for(context.close(), PAGE_CLOSE_TIMEOUT_S)
+                    except Exception:
+                        pass
+                    raise
+                contexts[locale] = [context, page]
             return contexts[locale][1]
 
         try:

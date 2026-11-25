@@ -972,7 +972,9 @@ def test_run_uses_one_context_per_locale(monkeypatch):
     assert len(ca) == 1 and len(other) == 1
     for kw in kws:
         assert kw["viewport"] == sr.VIEWPORT
-        assert kw["extra_http_headers"] == {"Accept-Language": "en-US,en;q=0.9"}
+    assert ca[0]["extra_http_headers"] == {"Accept-Language": "en-US,en;q=0.9"}
+    # unmapped hosts: exactly what main creates (viewport only)
+    assert other[0] == {"viewport": sr.VIEWPORT}
     assert [c.pages for _, c in browser.made] == [1, 1]
     assert len(_pngs(drive, "main")) == 4
 
@@ -1021,3 +1023,45 @@ def test_run_closes_contexts_when_the_run_itself_crashes(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(sr.cmd_run(entry))
     assert len(browser.made) == 2 and all(c.closed for _, c in browser.made)
+
+
+def test_unmapped_hosts_get_main_context_kwargs(monkeypatch):
+    urls = ["https://www.amazon.com/1", "https://www.amazon.de/2", "https://www.amazon.fr/3", "https://www.amazon.co.jp/4"]
+    drive, entry, browser = _locale_run(monkeypatch, urls, {u: "#1 Some Book" for u in urls})
+    asyncio.run(sr.cmd_run(entry))
+    assert [kw for kw, _ in browser.made] == [{"viewport": sr.VIEWPORT}]
+
+
+def test_mapped_hosts_get_locale_and_header(monkeypatch):
+    hosts = {"ca": "en-CA", "co.uk": "en-GB", "com.au": "en-AU", "in": "en-IN", "sg": "en-SG"}
+    urls = [f"https://www.amazon.{h}/1" for h in hosts]
+    drive, entry, browser = _locale_run(monkeypatch, urls, {u: "#1 Some Book" for u in urls})
+    asyncio.run(sr.cmd_run(entry))
+    assert len(browser.made) == 5
+    for kw, _ in browser.made:
+        assert kw["viewport"] == sr.VIEWPORT
+        assert kw["extra_http_headers"] == {"Accept-Language": "en-US,en;q=0.9"}
+    assert sorted(kw["locale"] for kw, _ in browser.made) == sorted(hosts.values())
+
+
+def test_context_closed_when_new_page_fails(monkeypatch):
+    urls = ["https://www.amazon.ca/1", "https://www.amazon.in/2"]
+    drive, entry, browser = _locale_run(monkeypatch, urls, {u: "#1 Some Book" for u in urls})
+    orig = browser.new_context
+
+    async def ctx_bad_page(**kw):
+        ctx = await orig(**kw)
+        if kw.get("locale") == "en-CA":
+            async def boom():
+                raise RuntimeError("no page")
+            ctx.new_page = boom
+        return ctx
+
+    browser.new_context = ctx_bad_page
+    try:
+        asyncio.run(sr.cmd_run(entry))
+    except SystemExit:
+        pass  # a row failed; whether the run exits is not what this test checks
+    bad = [c for kw, c in browser.made if kw.get("locale") == "en-CA"]
+    assert len(bad) == 1 and bad[0].closed
+    assert all(c.closed for _, c in browser.made)
