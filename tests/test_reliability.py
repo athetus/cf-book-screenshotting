@@ -1065,3 +1065,165 @@ def test_context_closed_when_new_page_fails(monkeypatch):
     bad = [c for kw, c in browser.made if kw.get("locale") == "en-CA"]
     assert len(bad) == 1 and bad[0].closed
     assert all(c.closed for _, c in browser.made)
+
+
+# ---------- blocked rows retried in a fresh browser context ----------
+
+BLOCKED = "Request was throttled"
+CA_URL = "https://www.amazon.ca/bestsellers"
+
+
+class _CtxWithState(_FakeContext):
+    def __init__(self, texts, label, raise_on_new_page=False):
+        super().__init__(texts)
+        self.label = label
+        self.closed = False
+        self._raise = raise_on_new_page
+
+    async def new_page(self):
+        if self._raise:
+            raise RuntimeError("boom")
+        return await super().new_page()
+
+
+class _SeqBrowser:
+    """First context uses the first text map; each later new_context() gets the next one."""
+
+    def __init__(self, maps):
+        self.maps = list(maps)
+        self.contexts = []
+        self.kwargs = []
+
+    async def new_context(self, **kw):
+        idx = len(self.contexts)
+        texts = self.maps[min(idx, len(self.maps) - 1)]
+        raise_np = isinstance(texts, tuple)
+        ctx = _CtxWithState(texts[0] if raise_np else texts, idx, raise_np)
+        self.contexts.append(ctx)
+        self.kwargs.append(kw)
+        return ctx
+
+    async def close(self):
+        pass
+
+
+def _setup_blocked(monkeypatch, url, maps):
+    rows = [["Fiction", url, "CA", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {})
+    browser = _SeqBrowser(maps)
+
+    class Chromium:
+        async def launch(self, headless=True):
+            return browser
+
+    class P:
+        chromium = Chromium()
+
+    class CM:
+        async def __aenter__(self):
+            return P()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(sr, "async_playwright", lambda: CM())
+    monkeypatch.setattr(sr, "BLOCKED_RETRY_WAIT_S", 0)
+    return drive, entry, hkey, browser
+
+
+def test_blocked_row_recovered_in_fresh_context(monkeypatch, capsys):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: BLOCKED}, {CA_URL: BLOCKED}, {CA_URL: "#2 Some Book"}])
+    asyncio.run(sr.cmd_run(entry))
+    assert len(_pngs(drive, "main")) == 1
+    assert len(browser.contexts) == 3  # cached one + two fresh (first fresh still blocked)
+    assert all(c.closed for c in browser.contexts[1:])
+    assert sr.chunk_done(drive, "mk", "S", hkey, 0, 1)
+    assert "recovered 1 blocked row(s) in a fresh context" in capsys.readouterr().out
+
+
+def test_blocked_row_recovered_on_first_fresh_attempt_uses_new_context(monkeypatch):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: BLOCKED}, {CA_URL: "#2 Some Book"}])
+    asyncio.run(sr.cmd_run(entry))
+    assert len(browser.contexts) == 2
+    assert browser.contexts[1] is not browser.contexts[0]
+    assert browser.kwargs[1]["locale"] == "en-CA"
+    assert browser.kwargs[1]["extra_http_headers"] == sr.ACCEPT_LANGUAGE
+    assert len(_pngs(drive, "main")) == 1
+
+
+def test_blocked_on_all_attempts_is_error_as_before_and_no_marker(monkeypatch, capsys):
+    rows_map = [{CA_URL: BLOCKED}]
+    drive, entry, hkey, browser = _setup_blocked(monkeypatch, CA_URL, rows_map)
+    with pytest.raises(SystemExit):  # one row, one error: found == 0
+        asyncio.run(sr.cmd_run(entry))
+    out = capsys.readouterr().out
+    assert "\n  - row 1: blocked/throttled by the site\n" in out
+    assert "recovered" not in out
+    assert len(browser.contexts) == 1 + sr.BLOCKED_RETRY_ATTEMPTS
+    assert _pngs(drive, "main") == []
+    assert not sr.chunk_done(drive, "mk", "S", hkey, 0, 1)
+
+
+def test_unmapped_host_fresh_context_is_viewport_only(monkeypatch):
+    url = "https://www.amazon.com/bestsellers"
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, url, [{url: BLOCKED}, {url: "#2 Some Book"}])
+    asyncio.run(sr.cmd_run(entry))
+    assert browser.kwargs[1] == {"viewport": sr.VIEWPORT}
+    assert len(_pngs(drive, "main")) == 1
+
+
+def test_fresh_context_closed_even_when_attempt_raises(monkeypatch):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: BLOCKED}, ({CA_URL: BLOCKED},), {CA_URL: "#2 Some Book"}])
+    asyncio.run(sr.cmd_run(entry))
+    assert browser.contexts[1].closed  # its new_page raised
+    assert browser.contexts[2].closed
+    assert len(_pngs(drive, "main")) == 1
+
+
+def test_blocked_retry_wait_uses_constant(monkeypatch):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: BLOCKED}, {CA_URL: "#2 Some Book"}])
+    monkeypatch.setattr(sr, "BLOCKED_RETRY_WAIT_S", 7)
+    waits = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(s, *a):
+        waits.append(s)
+        await real_sleep(0)
+
+    monkeypatch.setattr(sr.asyncio, "sleep", fake_sleep)
+    asyncio.run(sr.cmd_run(entry))
+    assert waits == [7]
+
+
+def test_blocked_retries_skipped_when_budget_spent(monkeypatch, capsys):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: BLOCKED}, {CA_URL: "#2 Some Book"}])
+    clock = {"t": 0.0}
+    monkeypatch.setattr(sr.time, "monotonic", lambda: clock["t"])
+    real_process = sr.process_row_limited
+
+    async def slow(page, *a):
+        try:
+            return await real_process(page, *a)
+        finally:
+            clock["t"] += sr.RUN_BUDGET_S + 1  # the first load used up the budget
+
+    monkeypatch.setattr(sr, "process_row_limited", slow)
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(browser.contexts) == 1
+    assert "\n  - row 1: blocked/throttled by the site\n" in capsys.readouterr().out
+
+
+def test_non_blocked_error_is_not_retried_in_fresh_context(monkeypatch):
+    drive, entry, hkey, browser = _setup_blocked(
+        monkeypatch, CA_URL, [{CA_URL: "RAISE"}, {CA_URL: "#2 Some Book"}])
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert len(browser.contexts) == 1
+    assert _pngs(drive, "main") == []

@@ -46,6 +46,11 @@ PAGE_CLOSE_TIMEOUT_S = 15  # closing a stuck page must not stall the chunk
 EVAL_TIMEOUT_S = 60  # page.evaluate on a hung page must not stall the chunk
 ROW_TIMEOUT_S = 240  # whole-row ceiling (two loads, a block retry, screenshot, upload)
 POST_LOAD_WAIT_MS = 2500
+# A row still blocked after its in-row retry gets this many more tries at the
+# end of the chunk, each in a brand-new browser context after this wait (a
+# fresh context loaded blocked regional pages where the reused one did not).
+BLOCKED_RETRY_ATTEMPTS = 2
+BLOCKED_RETRY_WAIT_S = 30
 DEFAULT_RUN_HOURS = [9, 19]
 # Rows per matrix job. ~7 s per row, so 120 rows is ~15 minutes, well inside
 # the job's timeout. Override with Settings!chunk_rows in the control sheet.
@@ -934,6 +939,10 @@ class RowError(Exception):
     """A row could not be processed (blocked, load failure, upload failure)."""
 
 
+class BlockedError(RowError):
+    """The site served its block/throttle page instead of the list."""
+
+
 # English-only locales for regional hosts. Amazon shows a "click the button
 # below to continue shopping" page to a default browser on these hosts; a
 # context whose locale matches the host plus an English Accept-Language header
@@ -986,7 +995,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         raise RowError(f"load failed: {e}") from e
 
     if is_blocked_page(body_text):
-        raise RowError("blocked/throttled by the site")
+        raise BlockedError("blocked/throttled by the site")
 
     if not keyword_in_text(keyword, body_text):
         if not looks_like_ranked_list(body_text):
@@ -1085,6 +1094,16 @@ def should_fail(found, errors, attempted=None):
     return len(errors) > max(2, attempted // 10)
 
 
+def context_kwargs(locale):
+    """Browser-context options for a locale (None = viewport only)."""
+    kwargs = {"viewport": VIEWPORT}
+    if locale:
+        # Only mapped English hosts change; other hosts stay exactly as before.
+        kwargs["locale"] = locale
+        kwargs["extra_http_headers"] = dict(ACCEPT_LANGUAGE)
+    return kwargs
+
+
 async def cmd_run(matrix_entry):
     sheet_id, drive_folder_id, filtered_folder_id, start, end, markers_id, hkey = decode_matrix_entry(matrix_entry)
     creds = get_credentials()
@@ -1115,6 +1134,8 @@ async def cmd_run(matrix_entry):
     deferred = 0
     errors = []
     not_found_rows = []
+    blocked_rows = []  # (row number, row, locale) still blocked after the in-row retry
+    recovered = 0
     started = time.monotonic()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -1123,12 +1144,7 @@ async def cmd_run(matrix_entry):
 
         async def page_for(locale):
             if locale not in contexts:
-                kwargs = {"viewport": VIEWPORT}
-                if locale:
-                    # Only mapped English hosts change; other hosts stay exactly as before.
-                    kwargs["locale"] = locale
-                    kwargs["extra_http_headers"] = dict(ACCEPT_LANGUAGE)
-                context = await browser.new_context(**kwargs)
+                context = await browser.new_context(**context_kwargs(locale))
                 try:
                     page = await context.new_page()
                 except BaseException:
@@ -1161,7 +1177,11 @@ async def cmd_run(matrix_entry):
                         not_found += 1
                         not_found_rows.append(i)
                 except Exception as e:
-                    errors.append(f"row {i}: {e}")
+                    if isinstance(e, BlockedError):
+                        # Reported only after the fresh-context retries below.
+                        blocked_rows.append((i, row, locale))
+                    else:
+                        errors.append(f"row {i}: {e}")
                     print(f"  ERROR row {i}: {public_text(e)}", flush=True)
                     # A fresh page after any failure, so one stuck or crashed
                     # page can't take down the rest of the chunk.
@@ -1172,6 +1192,42 @@ async def cmd_run(matrix_entry):
                         except Exception:
                             pass
                         contexts[locale][1] = await contexts[locale][0].new_page()
+
+            for i, row, locale in blocked_rows:
+                last_error = BlockedError("blocked/throttled by the site")
+                result = None  # None = not recovered, else True/False like process_row
+                for _attempt in range(BLOCKED_RETRY_ATTEMPTS):
+                    if time.monotonic() - started > RUN_BUDGET_S:
+                        break
+                    print(f"  row {i} blocked; retrying in a fresh context in {BLOCKED_RETRY_WAIT_S} s", flush=True)
+                    await asyncio.sleep(BLOCKED_RETRY_WAIT_S)
+                    fresh = None
+                    try:
+                        fresh = await browser.new_context(**context_kwargs(locale))
+                        fresh_page = await fresh.new_page()
+                        result = await process_row_limited(
+                            fresh_page, row, drive_service, drive_folder_id, filtered_folder_id, label)
+                        break
+                    except Exception as e:
+                        last_error = e
+                        print(f"  ERROR row {i} (fresh context): {public_text(e)}", flush=True)
+                    finally:
+                        if fresh is not None:
+                            try:
+                                await asyncio.wait_for(fresh.close(), PAGE_CLOSE_TIMEOUT_S)
+                            except Exception:
+                                pass
+                if result is None:
+                    errors.append(f"row {i}: {last_error}")
+                elif result:
+                    found += 1
+                    recovered += 1
+                    done.add(row_suffix(row))
+                else:
+                    not_found += 1
+                    recovered += 1
+                    not_found_rows.append(i)
+            not_found_rows.sort()
         finally:
             for context, _page in contexts.values():
                 try:
@@ -1181,6 +1237,8 @@ async def cmd_run(matrix_entry):
             await browser.close()
 
     summary = summarize(label, start, last, found, not_found, errors, skipped, not_found_rows)
+    if recovered:
+        summary += f", recovered {recovered} blocked row(s) in a fresh context"
     print(f"Done: {summary}", flush=True)
     if deferred:
         summary += f", {deferred} left for the next run"
