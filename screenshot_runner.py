@@ -604,14 +604,113 @@ def mark_chunk_done(drive_service, markers_id, sheet_id, hour_key_, start, end, 
     write_marker(drive_service, markers_id, marker_name(sheet_id, hour_key_, start, end), summary)
 
 
-def write_marker(drive_service, markers_id, name, text):
+def write_marker(drive_service, markers_id, name, text, description=None):
     media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=False)
+    body = {"name": name, "parents": [markers_id]}
+    if description is not None:
+        body["description"] = description
     drive_service.files().create(
-        body={"name": name, "parents": [markers_id]},
+        body=body,
         media_body=media,
         fields="id",
         supportsAllDrives=True,
     ).execute()
+
+
+RESULT_KEYS = ("found", "not_found", "blocked", "error", "skipped")
+
+
+def result_name(sheet_id, hour_key_, start, end, unix_time):
+    return f"result_{sheet_id}_{hour_key_}_{start}-{end}_{unix_time}"
+
+
+def write_result(drive_service, markers_id, sheet_id, hour_key_, start, end, outcomes):
+    """Record which rows of this chunk were found, not in the list, blocked,
+    errored or skipped (row numbers only, compact JSON in the file's
+    description) so the daily digest can report per row."""
+    data = {k: sorted(outcomes.get(k, [])) for k in RESULT_KEYS}
+    write_marker(drive_service, markers_id, result_name(sheet_id, hour_key_, start, end, int(time.time())),
+                 "row outcomes are in this file's description",
+                 json.dumps(data, separators=(",", ":")))
+
+
+def results_since(drive_service, markers_id, sheet_id, since_utc):
+    """Parsed result files of one book created since since_utc, as a list of
+    (hour_key, outcomes). Malformed files are ignored."""
+    prefix = f"result_{sheet_id}_"
+    q = (
+        f"'{markers_id}' in parents and trashed = false and "
+        f"createdTime >= '{since_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
+    )
+    out = []
+    page_token = None
+    while True:
+        kwargs = dict(
+            q=q,
+            fields="nextPageToken, files(name, description)",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            pageSize=1000,
+        )
+        if page_token:
+            kwargs["pageToken"] = page_token
+        res = drive_service.files().list(**kwargs).execute(num_retries=READ_RETRIES)
+        for f in res.get("files", []):
+            name = f.get("name", "")
+            if not name.startswith(prefix):
+                continue
+            hour = name[len(prefix):].split("_")[0]
+            try:
+                data = json.loads(f.get("description") or "")
+                if not hour or not isinstance(data, dict):
+                    continue
+                outcomes = {}
+                for k in RESULT_KEYS:
+                    rows = data.get(k, [])
+                    if not isinstance(rows, list) or not all(type(n) is int for n in rows):
+                        raise ValueError(k)
+                    outcomes[k] = rows
+            except ValueError:
+                continue
+            out.append((hour, outcomes))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            return out
+
+
+def _row_list(rows):
+    return ", ".join(str(n) for n in rows)
+
+
+def row_digest_lines(title, results):
+    """Digest text for one book from its result files: (text appended to the
+    count line, list of separate warning lines)."""
+    hours = {h for h, _ in results}
+    runs = len(hours)
+    per_row = {}  # row -> {outcome: set of hours}
+    for hour, outcomes in results:
+        for k, rows in outcomes.items():
+            for n in rows:
+                per_row.setdefault(n, {}).setdefault(k, set()).add(hour)
+    read = {n for n, o in per_row.items() if o.get("found") or o.get("skipped")}
+    never_found = {n for n in per_row if n not in read}
+    not_listed = sorted(n for n in never_found if per_row[n].get("not_found"))
+    never_read = sorted(n for n in never_found if per_row[n].get("blocked") and not per_row[n].get("not_found"))
+    blocked = sorted(n for n in per_row if per_row[n].get("blocked") and n not in never_read)
+    text = f" over {runs} runs."
+    if not_listed:
+        listed_runs = {n: len(per_row[n]["not_found"]) for n in not_listed}
+        label = "all runs" if all(c == runs for c in listed_runs.values()) else "some runs"
+        text += f" Not in the list ({label}): rows {_row_list(not_listed)}."
+    if blocked:
+        text += " Blocked at least once: " + ", ".join(
+            f"row {n} ({len(per_row[n]['blocked'])} of {runs} runs)" for n in blocked) + "."
+    warnings = []
+    if never_read:
+        all_blocked = all(len(per_row[n]["blocked"]) == runs for n in never_read)
+        how = f"blocked in all {runs} runs" if all_blocked else f"blocked, never read in {runs} runs"
+        warnings.append(f":warning: {title}: page never read ({how}): rows {_row_list(never_read)}")
+    return text, warnings
 
 
 # ---------- daily digest ----------
@@ -637,7 +736,8 @@ def expected_runs(job, run_hours, now_utc):
 def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_hours, now_utc,
                       max_seconds=DIGEST_MAX_SECONDS, clock=time.monotonic):
     """Post one Slack message per IST day listing, for each book whose window
-    is open, the screenshots saved in the last 24 h against what was expected.
+    is open, the screenshots saved in the last 24 h and, from the per-chunk
+    result files, which rows were not in the list or were blocked.
     Returns True if a message went out. Raises on Drive/Sheets errors; the
     caller decides that a digest failure never stops dispatch."""
     now_ist = now_utc.astimezone(DIGEST_TZ)
@@ -670,7 +770,6 @@ def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_
             lines.append(f"sheet {tag}: could not check")
             continue
         try:
-            n_rows = len(load_rows(sheets_service, job["sheet_id"]))
             # find only: a book never dispatched has no folder yet, and the digest must not create one
             folder_id = find_subfolder(drive_service, drive_folder_id, title)
             saved = len(files_since(drive_service, folder_id, since)) if folder_id else 0
@@ -678,11 +777,18 @@ def post_daily_digest(drive_service, sheets_service, drive_folder_id, jobs, run_
             print(f"::warning::digest: sheet {tag} could not be checked ({public_text(e)})", flush=True)
             lines.append(f"{title}: could not check")
             continue
-        expected = expected_runs(job, run_hours, now_utc) * n_rows
-        line = f"{title}: {saved} screenshots saved in the last 24 h (expected about {expected})"
-        if saved == 0 and expected > 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
+        detail, warnings = "", []
+        try:
+            results = results_since(drive_service, markers_id, job["sheet_id"], since)
+            if results:
+                detail, warnings = row_digest_lines(title, results)
+        except Exception as e:
+            print(f"::warning::digest: sheet {tag} row results could not be read ({public_text(e)})", flush=True)
+        line = f"{title}: {saved} screenshots saved in the last 24 h" + (detail or "")
+        if saved == 0 and expected_runs(job, run_hours, now_utc) > 0 and now_utc - job["start"] > DIGEST_ALERT_AFTER:
             line = f":warning: {line} - NO screenshots yet"
         lines.append(line)
+        lines.extend(warnings)
     if not notify_slack("Daily screenshot digest\n" + "\n".join(lines)):
         return False  # not marked, so the next trigger tries again
     try:
@@ -1134,6 +1240,10 @@ async def cmd_run(matrix_entry):
     deferred = 0
     errors = []
     not_found_rows = []
+    found_rows = []
+    skipped_rows = []
+    error_rows = []
+    blocked_final = []
     blocked_rows = []  # (row number, row, locale) still blocked after the in-row retry
     recovered = 0
     started = time.monotonic()
@@ -1166,12 +1276,14 @@ async def cmd_run(matrix_entry):
                     # Already captured this hour (an earlier run that was cut off,
                     # or a duplicate row in the sheet).
                     skipped += 1
+                    skipped_rows.append(i)
                     continue
                 locale = _row_locale(row["url"])
                 try:
                     page = await page_for(locale)
                     if await process_row_limited(page, row, drive_service, drive_folder_id, filtered_folder_id, label):
                         found += 1
+                        found_rows.append(i)
                         done.add(row_suffix(row))
                     else:
                         not_found += 1
@@ -1182,6 +1294,7 @@ async def cmd_run(matrix_entry):
                         blocked_rows.append((i, row, locale))
                     else:
                         errors.append(f"row {i}: {e}")
+                        error_rows.append(i)
                     print(f"  ERROR row {i}: {public_text(e)}", flush=True)
                     # A fresh page after any failure, so one stuck or crashed
                     # page can't take down the rest of the chunk.
@@ -1226,8 +1339,10 @@ async def cmd_run(matrix_entry):
                                 pass
                 if result is None:
                     errors.append(f"row {i}: {last_error}")
+                    (blocked_final if isinstance(last_error, BlockedError) else error_rows).append(i)
                 elif result:
                     found += 1
+                    found_rows.append(i)
                     recovered += 1
                     done.add(row_suffix(row))
                 else:
@@ -1247,6 +1362,12 @@ async def cmd_run(matrix_entry):
     if recovered:
         summary += f", recovered {recovered} blocked row(s) in a fresh context"
     print(f"Done: {summary}", flush=True)
+    try:
+        write_result(drive_service, markers_id, sheet_id, hkey, start, end, {
+            "found": found_rows, "not_found": not_found_rows, "blocked": blocked_final,
+            "error": error_rows, "skipped": skipped_rows})
+    except Exception as e:
+        print(f"::warning::could not write result file: {public_text(e)}", flush=True)
     if deferred:
         summary += f", {deferred} left for the next run"
         notify_slack(f":warning: Screenshots for {title}: {summary} (the time budget ran out; "

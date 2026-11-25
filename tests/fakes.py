@@ -23,7 +23,7 @@ class FakeDriveFiles:
         self.create_lands_then_fails = False
         self.page_size_cap = None
 
-    def add(self, name, parent, mime="image/png", created=None):
+    def add(self, name, parent, mime="image/png", created=None, description=None):
         fid = f"f{self._next}"
         self._next += 1
         self.files[fid] = {
@@ -31,6 +31,7 @@ class FakeDriveFiles:
             "parents": [parent],
             "mimeType": mime,
             "createdTime": created or datetime.now(timezone.utc),
+            "description": description,
         }
         return fid
 
@@ -55,7 +56,7 @@ class FakeDriveFiles:
         self.calls.append(("list", kw))
 
         def run():
-            hits = [{"id": i, "name": f["name"]} for i, f in self.files.items() if self._match(kw["q"], f)]
+            hits = [{"id": i, "name": f["name"], "description": f["description"]} for i, f in self.files.items() if self._match(kw["q"], f)]
             size = kw.get("pageSize", 100)
             if self.page_size_cap:
                 size = min(size, self.page_size_cap)
@@ -75,9 +76,9 @@ class FakeDriveFiles:
             if self.create_failures:
                 exc = self.create_failures.pop(0)
                 if self.create_lands_then_fails:
-                    self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"))
+                    self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"), description=body.get("description"))
                 raise exc
-            fid = self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"))
+            fid = self.add(body["name"], body["parents"][0], body.get("mimeType", "image/png"), description=body.get("description"))
             return {"id": fid}
 
         return FakeExec(run)

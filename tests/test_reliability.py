@@ -1283,3 +1283,88 @@ def test_non_blocked_error_is_not_retried_in_fresh_context(monkeypatch):
         asyncio.run(sr.cmd_run(entry))
     assert len(browser.contexts) == 1
     assert _pngs(drive, "main") == []
+
+
+# ---------- per-row result file written once per chunk ----------
+
+def _results(drive):
+    out = []
+    for f in drive.files().files.values():
+        if f["parents"] == ["mk"] and f["name"].startswith("result_"):
+            out.append((f["name"], json.loads(f["description"])))
+    return out
+
+
+def _mixed_run(monkeypatch):
+    monkeypatch.setattr(sr, "notify_slack", lambda t: None)
+    monkeypatch.setattr(sr, "BLOCKED_RETRY_WAIT_S", 0)
+    rows = [_row(i) for i in range(1, 6)]
+    rows = [[r["category"], r["url"], r["country"], r["keyword"]] for r in rows]
+    texts = {
+        "https://a/1": "#1 Some Book",   # found
+        "https://a/2": "#1 Other #2 More",  # not in the list
+        "https://a/3": "RAISE",          # error
+        "https://a/4": "#1 Some Book",   # skipped (already done this hour)
+        "https://a/5": BLOCKED,          # blocked after all retries
+    }
+    drive, entry, hkey = _setup_run(monkeypatch, rows, texts)
+    _mark_done(drive, 4)
+    return drive, entry, hkey
+
+
+def test_run_writes_one_result_file_with_row_lists(monkeypatch):
+    drive, entry, hkey = _mixed_run(monkeypatch)
+    monkeypatch.setattr(sr.time, "time", lambda: 1234567890.9)
+    asyncio.run(sr.cmd_run(entry))  # 1 found of 4 tried: no SystemExit
+    res = _results(drive)
+    assert len(res) == 1
+    name, data = res[0]
+    assert name == f"result_S_{hkey}_0-5_1234567890"
+    assert data == {"found": [1], "not_found": [2], "blocked": [5], "error": [3], "skipped": [4]}
+
+
+def test_result_file_is_written_when_the_run_fails(monkeypatch):
+    monkeypatch.setattr(sr, "notify_slack", lambda t: None)
+    drive, entry, _ = _setup_run(monkeypatch, [["Fiction", "https://a/1", "US", "Some Book"]],
+                                 {"https://a/1": "RAISE"})
+    with pytest.raises(SystemExit):
+        asyncio.run(sr.cmd_run(entry))
+    assert [d for _, d in _results(drive)] == [
+        {"found": [], "not_found": [], "blocked": [], "error": [1], "skipped": []}]
+
+
+def test_result_file_is_written_before_the_done_marker_decision(monkeypatch):
+    rows = [["Fiction", "https://a/1", "US", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Some Book"})
+    asyncio.run(sr.cmd_run(entry))
+    assert len(_results(drive)) == 1
+    assert sr.chunk_done(drive, "mk", "S", hkey, 0, 1)
+
+
+def test_result_write_failure_only_warns_and_changes_nothing(monkeypatch, capsys):
+    rows = [["Fiction", "https://a/1", "US", "Some Book"]]
+    drive, entry, hkey = _setup_run(monkeypatch, rows, {"https://a/1": "#1 Some Book"})
+    drive.files().create_failures = []
+    real = sr.write_marker
+
+    def flaky(d, markers_id, name, text, description=None):
+        if name.startswith("result_"):
+            raise RuntimeError("drive down")
+        return real(d, markers_id, name, text, description)
+
+    monkeypatch.setattr(sr, "write_marker", flaky)
+    asyncio.run(sr.cmd_run(entry))  # no exception, exit code unchanged
+    out = capsys.readouterr().out
+    assert "::warning::could not write result file" in out
+    assert _results(drive) == []
+    assert sr.chunk_done(drive, "mk", "S", hkey, 0, 1)  # done-marker logic untouched
+
+
+def test_result_write_failure_does_not_turn_a_failing_run_into_another_error(monkeypatch):
+    monkeypatch.setattr(sr, "notify_slack", lambda t: None)
+    drive, entry, _ = _setup_run(monkeypatch, [["Fiction", "https://a/1", "US", "Some Book"]],
+                                 {"https://a/1": "RAISE"})
+    monkeypatch.setattr(sr, "write_marker", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    with pytest.raises(SystemExit) as e:
+        asyncio.run(sr.cmd_run(entry))
+    assert e.value.code == 1
