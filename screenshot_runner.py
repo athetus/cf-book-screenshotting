@@ -53,7 +53,7 @@ BLOCKED_RETRY_ATTEMPTS = 2
 BLOCKED_RETRY_WAIT_S = 30
 # Amazon's soft block page has a "continue shopping" button. Clicking it and
 # reloading the original URL gave the ranked list in 28 of 28 blocked loads
-# (probe 25 Nov 2026, docs/research/2026-11-25-click-through-probe.md).
+# (probe on 25 Nov 2026, 20 loads per arm on two regional hosts).
 CLICK_CYCLES = 2
 POST_CLICK_WAIT_MS = 3000
 CONTINUE_SELECTOR = (
@@ -1143,7 +1143,7 @@ async def process_row(page, row, drive_service, drive_folder_id, filtered_folder
         if is_blocked_page(body_text):
             print("  blocked/throttled by the site; retrying once in 20 s", flush=True)
             await page.wait_for_timeout(20000)
-            body_text = await _load_clearing_block(page, url)
+            body_text = await _load(page, url)  # plain: clicks here would push a blocked row past ROW_TIMEOUT_S
     except Exception as e:
         raise RowError(f"load failed: {e}") from e
 

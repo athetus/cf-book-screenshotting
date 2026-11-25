@@ -49,13 +49,21 @@ def test_soft_block_is_cleared_by_click_and_reload():
     assert page.clicks == 1 and page.gotos == 2
 
 
-def test_click_cycles_are_capped_then_old_retry_and_blocked_error():
+def test_click_cycles_are_capped_and_the_20s_retry_does_not_click():
     page = ClickablePage([SOFT])
     with pytest.raises(sr.BlockedError):
         run(page)
-    # first load + CLICK_CYCLES reloads, then the 20 s retry does the same again
-    assert page.clicks == 2 * sr.CLICK_CYCLES
-    assert page.gotos == 2 * (1 + sr.CLICK_CYCLES)
+    # first load + CLICK_CYCLES reloads, then one plain retry load. This keeps a
+    # persistently blocked row inside ROW_TIMEOUT_S so its fresh-context retries still run.
+    assert page.clicks == sr.CLICK_CYCLES
+    assert page.gotos == 1 + sr.CLICK_CYCLES + 1
+
+
+def test_worst_case_blocked_row_fits_the_row_timeout():
+    loads = 1 + sr.CLICK_CYCLES + 1
+    nav = sr.NAV_TIMEOUT_MS / 1000 + sr.POST_LOAD_WAIT_MS / 1000
+    worst = loads * nav + sr.CLICK_CYCLES * (5 + sr.POST_CLICK_WAIT_MS / 1000) + 20
+    assert worst < sr.ROW_TIMEOUT_S
 
 
 def test_no_button_means_no_click_and_old_behaviour():
