@@ -89,3 +89,21 @@ def test_keyword_absent_after_click_is_not_found_not_blocked():
     page = ClickablePage([SOFT, "#1 Other Book #2 Another Book"])
     assert run(page) is False
     assert page.clicks == 1
+
+
+def test_click_and_outcome_are_logged(capsys):
+    page = ClickablePage([SOFT, "#4 Some Book by Jane"])
+    assert run(page) is True
+    out = capsys.readouterr().out
+    assert "click-through: clicked continue (1 of" in out
+    assert "click-through: block cleared after click" in out
+
+
+def test_click_that_does_not_clear_is_logged(capsys):
+    page = ClickablePage([SOFT])
+    with pytest.raises(sr.BlockedError):
+        run(page)
+    out = capsys.readouterr().out
+    assert "click-through: clicked continue (1 of" in out
+    assert "click-through: still blocked after click" in out
+    assert "block cleared" not in out

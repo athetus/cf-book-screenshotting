@@ -1120,11 +1120,14 @@ async def _load_clearing_block(page, url):
     """Load the URL; if Amazon shows its soft block, click through and reload
     the original URL (up to CLICK_CYCLES times). Returns the last page text."""
     body_text = await _load(page, url)
-    for _ in range(CLICK_CYCLES):
+    for cycle in range(CLICK_CYCLES):
         if not is_blocked_page(body_text) or not await _click_continue(page):
             break
+        print(f"  click-through: clicked continue ({cycle + 1} of {CLICK_CYCLES}), reloading", flush=True)
         await page.wait_for_timeout(POST_CLICK_WAIT_MS)
         body_text = await _load(page, url)
+        print("  click-through: " + ("still blocked after click" if is_blocked_page(body_text)
+                                     else "block cleared after click"), flush=True)
     return body_text
 
 
